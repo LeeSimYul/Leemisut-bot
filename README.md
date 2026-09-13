@@ -15,6 +15,7 @@
 - **Framework**: `discord.py` v2.x (Slash Commands, Discord UI Components)
 - **Database**: `aiosqlite` (Async SQLite3)
 - **Open API**: 국립국어원 한국수어사전 / 문화공공데이터광장 API
+> 본 프로젝트는 국립국어원(한국수어사전) 및 문화공공데이터광장의 Open API 데이터를 활용하여 제작되었습니다.
 - **AI Collaborators**: Gemini (Architecture & Specification), Claude (Core Code Implementation)
 
 ## 👤 저작권 및 작성자 (Author & License)
