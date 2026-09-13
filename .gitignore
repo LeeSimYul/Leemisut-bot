@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ==========================================
+# Custom Project Additions (이미숫 봇 커스텀 설정)
+# ==========================================
+
+# 1. 커스텀 데이터베이스 파일 (파일명 상관없이 모두 제외)
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+
+# 2. 로컬 테스트용 미디어 및 로그 폴더
+/logs/
+/temp/
