@@ -1,4 +1,4 @@
-# 🤟 VRChat 한국수어교실 디스코드 조교 봇: '이미숫' (Leemisut Bot)
+# 🤟 VRChat 한국수어교실 디스코드 학습 조교 봇: '이미숫' (LeeMiSut Bot)
 
 <div align="center">
 
