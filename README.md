@@ -38,6 +38,6 @@ cd Leemisut-bot
 ## 📜 라이선스 및 저작권 (License & Copyright)
 - **Code Engine:** Licensed under the [MIT License](./LICENSE).
 - **Brand & Assets:** Copyright (c) 2026 LeeSimYul. All rights reserved.
-- 본 프로젝트는 코드와 캐릭터 자산에 대해 이중 라이선스(Dual License)를 적용합니다.
+- 본 프로젝트는 코드와 캐릭터 자산에 대해 라이선스(License)를 적용합니다.
   - Source Code: MIT License에 따라 소스코드의 자유로운 참고 및 재사용이 가능합니다.
   - Brand & Persona: '조교 이미숫(Leemisut)' 캐릭터 이름, 프로필 이미지, 고유 대사 템플릿의 소유권은 이심율(LeeSimYul) 및 VRChat 한국수어교실에 있으며 무단 상업적 도용을 금지합니다.
