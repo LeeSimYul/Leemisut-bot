@@ -15,6 +15,11 @@
 
 </div>
 
+## ☕ 이미숫 가이드라인(Notion)
+- 🤖 **[Discord Bot 이미숫 공식 설명서](https://likeable-bucket-c21.notion.site/Discord-Bot-c7dc1254368c4a4fbcdf2e1ef6ca23a4?source=copy_link)**
+- 📜 **[Discord Bot 이미숫 서비스 이용 약관](https://likeable-bucket-c21.notion.site/Discord-Bot-27213199bb4f43f49d679a2842c87c1c?source=copy_link)**
+- 📃 **[Discord Bot 이미숫 개인정보 보호 정책](https://likeable-bucket-c21.notion.site/Discord-Bot-3d9a401b5418801c9f0afbcae52fca29?source=copy_link)**
+
 ## ✨ 주요 기능
 - **🤟 /오늘의수어**: 날짜(KST)를 기준으로 매일 새로운 한국수어 단어 및 수어 설명/동영상 카드 전송
 - **🧩 /수어퀴즈**: 3,754개 수어 DB 기반 수어 동작 영상 보고 단어 맞추기 (버튼 UI, 스포일러 방지, 포인트/EXP 게이머화)
