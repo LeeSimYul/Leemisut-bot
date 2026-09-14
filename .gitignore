@@ -222,10 +222,18 @@ __marimo__/
 # ==========================================
 
 # 1. 커스텀 데이터베이스 파일 (파일명 상관없이 모두 제외)
+#    유저 포인트 · 출석 · 퀴즈 기록 · 단어장이 담긴 DB는 절대 올리지 않습니다.
+data/
 *.db
 *.sqlite
 *.sqlite3
-data/*.db
+#    SQLite 가 DB 옆에 만드는 임시 파일 (WAL 로그 · 공유 메모리 · 롤백 저널)
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
 
 # 2. 로컬 테스트용 미디어 및 로그 폴더
 /logs/
