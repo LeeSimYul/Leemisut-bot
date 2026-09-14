@@ -1,19 +1,26 @@
 """
 cogs/general.py
-조교 이미숫 - 기본 명령어 (/안녕, /명언, /격언)
+조교 이미숫 - 기본 명령어 (/안녕, /명언, /격언, /내정보)
 
 /명언 은 한 문장을 보여 주고 "이걸 수어로 어떻게 옮길까?"를 떠올리게 하는 학습용 명령어입니다.
 문구를 추가하시려면 아래 QUOTES 목록에 Quote(...) 한 줄만 더 쓰시면 됩니다.
+
+/안녕 의 명령어 안내판은 HELP_TEXT 에 있습니다. 일반 유저용 명령어를 추가하면 여기도 함께 고쳐 주세요.
+/내정보 는 레벨 · 경험치 · 포인트 · 연속 출석 · 단어장 개수를 한눈에 보여 줍니다.
 """
 from __future__ import annotations
 
 import logging
 import random
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 
+import aiosqlite
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+from database import Database
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +140,30 @@ PRACTICE_TIP = (
 )
 FOOTER_TEXT = "오늘도 마음으로 그리는 수어 한 문장 🤟"
 
+# 연타 방지: 유저당 COOLDOWN_SECONDS 초에 1회 (명령어마다 따로 계산)
+COOLDOWN_SECONDS = 3.0
+COOLDOWN_MESSAGE = f"조교가 조금 바빠요! {COOLDOWN_SECONDS:g}초 후에 다시 시도해 주세요 ⏱️"
+
+# /안녕 안내판 - 일반 유저용 명령어를 갈래별로 모았습니다. (임베드 필드 1칸 = 최대 1024자)
+HELP_TEXT = (
+    "**🤟 수어 학습**\n"
+    "`/오늘의수어` — 나에게 맞춘 오늘의 단어 & 출석 체크\n"
+    "`/수어검색` — 단어 · 분야 조건으로 수어 사전 검색\n"
+    "\n**🧩 퀴즈 & 복습**\n"
+    "`/수어퀴즈` — 수어 퀴즈 풀기 (틀린 단어는 복습 문제로 다시 나와요)\n"
+    "`/단어장저장` · `/수어단어장` — 나만의 단어장에 담고 모아 보기\n"
+    "\n**📜 표현력 향상**\n"
+    "`/명언` 또는 `/격언` — 한 문장을 수어로 어떻게 옮길지 생각하기\n"
+    "\n**👤 개인 프로필**\n"
+    "`/내정보` — 내 레벨 · 포인트 · 연속 출석일 확인"
+)
+
+# /내정보 설정
+KST = timezone(timedelta(hours=9))  # 출석 날짜 기준 (cogs/sign_language.py 의 KST 와 같아야 합니다)
+EXP_PER_LEVEL = 100                 # 경험치 100마다 레벨 1 상승 (30 exp → 레벨 1, 130 exp → 레벨 2)
+LEVEL_BAR_LENGTH = 10
+COLOR_PROFILE = discord.Color.from_rgb(126, 179, 255)
+
 
 def build_quote_embed(quote: Quote) -> discord.Embed:
     """문구 하나를 임베드로 만듭니다."""
@@ -154,14 +185,76 @@ def build_quote_embed(quote: Quote) -> discord.Embed:
     return embed
 
 
+def level_progress(exp: int) -> tuple[int, int]:
+    """
+    경험치로 레벨을 계산합니다. 반환: (레벨, 이번 레벨에서 쌓은 경험치)
+    ※ DB 의 users.level 은 지금까지 올려 주는 곳이 없어 늘 1이므로, 표시할 때 경험치로 계산합니다.
+    """
+    exp = max(0, exp)
+    return exp // EXP_PER_LEVEL + 1, exp % EXP_PER_LEVEL
+
+
+def streak_text(user: aiosqlite.Row | None, today: date) -> str:
+    """
+    연속 출석 표시. DB 의 streak 은 출석할 때만 바뀌므로 마지막 출석일을 함께 봅니다.
+    (/오늘의수어 와 같은 규칙: 어제 출석했으면 이어지고, 그보다 오래됐으면 끊긴 것)
+    """
+    last = user["last_daily_date"] if user else None
+    if not last:
+        return "아직 출석 기록이 없어요\n`/오늘의수어` 로 첫 출석!"
+    if last == today.isoformat():
+        return f"**{user['streak']}**일차 ✅\n오늘 출석 완료!"
+    if last == (today - timedelta(days=1)).isoformat():
+        return f"**{user['streak']}**일차\n오늘 `/오늘의수어` 로 이어 가요!"
+    return "끊겼어요 😢\n`/오늘의수어` 로 다시 시작!"
+
+
+def build_profile_embed(
+    name: str, avatar_url: str | None, user: aiosqlite.Row | None, bookmark_count: int, today: date
+) -> discord.Embed:
+    """/내정보 임베드. 아직 한 번도 활동하지 않은 유저(user=None)는 0으로 보여 줍니다."""
+    exp = user["exp"] if user else 0
+    points = user["points"] if user else 0
+    level, gained = level_progress(exp)
+    filled = gained * LEVEL_BAR_LENGTH // EXP_PER_LEVEL
+    bar = "▰" * filled + "▱" * (LEVEL_BAR_LENGTH - filled)
+
+    embed = discord.Embed(title=f"👤 {name} 님의 수어 학습 프로필", color=COLOR_PROFILE)
+    if user is None:
+        embed.description = "아직 학습 기록이 없어요! `/오늘의수어` 로 첫걸음을 떼 보세요 🌱"
+    if avatar_url:
+        embed.set_thumbnail(url=avatar_url)
+
+    embed.add_field(
+        name="🎖️ 레벨 · 🧪 경험치",
+        value=(
+            f"레벨 **{level}** · 경험치 **{exp}** exp\n"
+            f"`{bar}` 다음 레벨까지 **{EXP_PER_LEVEL - gained}** exp"
+        ),
+        inline=False,
+    )
+    embed.add_field(name="🪙 보유 포인트", value=f"**{points}** pt", inline=True)
+    embed.add_field(name="🔥 연속 출석", value=streak_text(user, today), inline=True)
+    embed.add_field(
+        name="📚 단어장",
+        value=f"**{bookmark_count}**개 저장 중\n"
+              + ("`/수어단어장` 에서 보기" if bookmark_count else "`/단어장저장` 으로 담아 보세요"),
+        inline=True,
+    )
+    embed.set_footer(text="경험치는 /오늘의수어 출석과 /수어퀴즈 정답으로 쌓여요 🤟")
+    return embed
+
+
 class General(commands.Cog, name="기본"):
-    def __init__(self, bot: commands.Bot) -> None:
+    def __init__(self, bot: commands.Bot, db: Database) -> None:
         self.bot = bot
+        self.db = db  # /내정보 에서 유저 기록을 읽습니다
         # 채널마다 바로 직전에 나온 문구를 기억해 두 번 연속 같은 문장이 나오지 않게 합니다.
         self._last_shown: dict[int, str] = {}
 
     # ── /안녕 ────────────────────────────────────────────────────
     @app_commands.command(name="안녕", description="이미숫 조교와 인사를 나눕니다.")
+    @app_commands.checks.cooldown(1, COOLDOWN_SECONDS)
     async def hello(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()  # ← 3초 타임아웃 방지
 
@@ -173,16 +266,30 @@ class General(commands.Cog, name="기본"):
             ),
             color=discord.Color.from_rgb(255, 183, 77),
         )
-        embed.add_field(
-            name="📚 이런 걸 할 수 있어요",
-            value=(
-                "`/오늘의수어` — 오늘 배울 수어 단어를 알려 드려요\n"
-                "`/수어퀴즈` — 수어 동작을 보고 단어를 맞혀 봐요\n"
-                "`/명언 or /격언` — 한 문장을 수어로 옮겨 표현력을 길러요"
-            ),
-            inline=False,
-        )
+        embed.add_field(name="📚 이런 걸 할 수 있어요", value=HELP_TEXT, inline=False)
         embed.set_footer(text="궁금한 게 있으면 언제든 불러 주세요! 🤟")
+        await interaction.followup.send(embed=embed)
+
+    # ── /내정보 ──────────────────────────────────────────────────
+    @app_commands.command(
+        name="내정보",
+        description="나의 수어 학습 레벨, 포인트, 연속 출석일수, 단어장 현황을 확인합니다.",
+    )
+    @app_commands.checks.cooldown(1, COOLDOWN_SECONDS)
+    async def my_profile(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()  # ← 3초 타임아웃 방지
+
+        user_id = interaction.user.id
+        user = await self.db.get_user(user_id)  # 한 번도 활동 안 했으면 None (새로 만들지 않음)
+        bookmarks = await self.db.get_user_bookmarks(user_id)
+
+        embed = build_profile_embed(
+            interaction.user.display_name,
+            interaction.user.display_avatar.url,
+            user,
+            len(bookmarks),
+            datetime.now(KST).date(),
+        )
         await interaction.followup.send(embed=embed)
 
     # ── /명언 ────────────────────────────────────────────────────
@@ -198,6 +305,7 @@ class General(commands.Cog, name="기본"):
         app_commands.Choice(name="🌙 문학·소설", value="문학"),
         app_commands.Choice(name="💡 명언·격언", value="명언"),
     ])
+    @app_commands.checks.cooldown(1, COOLDOWN_SECONDS)
     async def quote_command(
         self, interaction: discord.Interaction, 분류: app_commands.Choice[str] | None = None
     ) -> None:
@@ -217,6 +325,7 @@ class General(commands.Cog, name="기본"):
         app_commands.Choice(name="🌙 문학·소설", value="문학"),
         app_commands.Choice(name="💡 명언·격언", value="명언"),
     ])
+    @app_commands.checks.cooldown(1, COOLDOWN_SECONDS)  # /명언 과 같은 기능이라 우회로가 되지 않도록
     async def saying_command(
         self, interaction: discord.Interaction, 분류: app_commands.Choice[str] | None = None
     ) -> None:
@@ -248,12 +357,18 @@ class General(commands.Cog, name="기본"):
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
         original = getattr(error, "original", error)
-        if isinstance(original, discord.NotFound) and original.code == 10062:
+
+        if isinstance(error, app_commands.CommandOnCooldown):
+            # 연타 방지 - 오류가 아니므로 로그 없이 본인에게만 안내합니다.
+            # (쿨다운은 명령어 실행 전에 걸리므로 defer 전이라 send_message 로 응답됩니다)
+            msg = COOLDOWN_MESSAGE
+        elif isinstance(original, discord.NotFound) and original.code == 10062:
             log.warning("만료된 상호작용 (10062): %s", interaction.command)
             return
+        else:
+            log.exception("기본 명령어 처리 중 오류", exc_info=error)
+            msg = "앗, 조교가 잠깐 헷갈렸어요 😵 잠시 후 다시 시도해 주세요!"
 
-        log.exception("기본 명령어 처리 중 오류", exc_info=error)
-        msg = "앗, 조교가 잠깐 헷갈렸어요 😵 잠시 후 다시 시도해 주세요!"
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(msg, ephemeral=True)
@@ -264,4 +379,4 @@ class General(commands.Cog, name="기본"):
 
 
 async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(General(bot))
+    await bot.add_cog(General(bot, bot.db))  # type: ignore[attr-defined]

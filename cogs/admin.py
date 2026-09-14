@@ -4,6 +4,7 @@ cogs/admin.py
 
 ⚠️ 모든 슬래시 명령어는 시작 직후 defer()로 응답을 미뤄 3초 타임아웃(10062)을 막습니다.
    defer 이후에는 반드시 interaction.followup.send() 를 사용해야 합니다.
+■ /수어목록 은 10개씩 페이지 버튼(◀ 이전 · 1 / N · ▶ 다음)으로 넘겨 봅니다. (utils/paginator.py)
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from database import Database
+from database import Database, load_admin_user_ids
 from utils.ksl_api import (
     KSLApiError,
     RejectedWord,
@@ -23,6 +24,7 @@ from utils.ksl_api import (
     fetch_many_sign_words,
     fetch_sign_words,
 )
+from utils.paginator import SignPaginatorView, page_count
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +32,7 @@ MAX_SYNC_KEYWORDS = 5      # /수어동기화 에서 한 번에 처리할 검색
 DEFAULT_MAX_PAGES = 40     # /수어전체동기화 기본 페이지 수 (100건 × 40 = 4,000)
 ROWS_PER_PAGE = 100        # 이 API의 페이지당 최대 건수
 PROGRESS_INTERVAL = 3.0    # 진행 상황 메시지 수정 간격(초) - 너무 잦으면 요청 제한에 걸립니다
+LIST_PAGE_SIZE = 10        # /수어목록 한 페이지에 보여 줄 단어 수
 
 COLOR_ADMIN = discord.Color.dark_teal()
 COLOR_FAIL = discord.Color.red()
@@ -57,10 +60,49 @@ def _fail_embed(exc: Exception) -> discord.Embed:
     return embed
 
 
+class NotBotAdmin(app_commands.CheckFailure):
+    """서버 관리자이지만 .env 의 ADMIN_USER_IDS 목록에는 없는 사람이 실행했을 때."""
+
+
+def bot_admin_only():
+    """
+    관리자 명령어 2중 검증의 두 번째 관문입니다.
+        1차: @app_commands.checks.has_permissions(administrator=True) → 서버 관리자인가?
+        2차: @bot_admin_only()                                        → 봇 관리자 목록에 있는가?
+
+    ⚠️ 체크는 함수에 가까운(아래쪽) 데코레이터부터 실행됩니다.
+       서버 권한을 먼저 보도록 has_permissions 를 async def 바로 위에 두세요.
+
+    - ADMIN_USER_IDS 가 비어 있으면 통과시킵니다. (서버 관리자 권한만 확인)
+    - 목록은 Admin Cog 가 로드될 때 한 번 읽어 둡니다. (Admin.admin_user_ids)
+    """
+
+    async def predicate(interaction: discord.Interaction) -> bool:
+        cog = interaction.command.binding if interaction.command else None
+        if not isinstance(cog, Admin):
+            raise NotBotAdmin()  # 목록을 확인할 수 없으면 막습니다 (fail-closed)
+        if cog.admin_user_ids and interaction.user.id not in cog.admin_user_ids:
+            log.warning(
+                "봇 관리자 목록에 없는 사용자의 관리자 명령어 시도: %s (%s) → /%s",
+                interaction.user, interaction.user.id, interaction.command.name,
+            )
+            raise NotBotAdmin()
+        return True
+
+    return app_commands.check(predicate)
+
+
 class Admin(commands.Cog, name="관리"):
     def __init__(self, bot: commands.Bot, db: Database) -> None:
         self.bot = bot
         self.db = db
+        # 관리자 명령어 2중 검증용 유저 ID 목록 (비어 있으면 서버 관리자 권한만 확인)
+        # 값이 잘못 적혀 있으면 ValueError 로 Cog 로드가 실패해 관리자 명령어가 잠깁니다.
+        self.admin_user_ids = load_admin_user_ids()
+        if self.admin_user_ids:
+            log.info("🔐 봇 관리자 %d명 등록 (ADMIN_USER_IDS)", len(self.admin_user_ids))
+        else:
+            log.info("🔓 ADMIN_USER_IDS 미설정 - 관리자 명령어는 서버 관리자 권한만 확인합니다.")
 
     # ── /수어동기화 ──────────────────────────────────────────────
     @app_commands.command(
@@ -71,7 +113,8 @@ class Admin(commands.Cog, name="관리"):
         단어명="예: 사랑  또는  사랑, 학교, 친구",
         미리보기="켜면 DB에 저장하지 않고 결과만 확인합니다.",
     )
-    @app_commands.checks.has_permissions(administrator=True)
+    @bot_admin_only()                                         # 2차: 봇 관리자 목록
+    @app_commands.checks.has_permissions(administrator=True)  # 1차: 서버 관리자 권한
     async def sync_signs(
         self, interaction: discord.Interaction, 단어명: str, 미리보기: bool = False
     ) -> None:
@@ -148,7 +191,8 @@ class Admin(commands.Cog, name="관리"):
         description="[관리자] 일상생활수어 전체(약 3,754건)를 순회하며 DB에 저장합니다.",
     )
     @app_commands.describe(페이지수="가져올 최대 페이지 수 (1페이지 = 100건, 기본 40)")
-    @app_commands.checks.has_permissions(administrator=True)
+    @bot_admin_only()                                         # 2차: 봇 관리자 목록
+    @app_commands.checks.has_permissions(administrator=True)  # 1차: 서버 관리자 권한
     async def sync_all_signs(
         self, interaction: discord.Interaction, 페이지수: app_commands.Range[int, 1, 100] = DEFAULT_MAX_PAGES
     ) -> None:
@@ -239,7 +283,8 @@ class Admin(commands.Cog, name="관리"):
     # ── /수어삭제 ────────────────────────────────────────────────
     @app_commands.command(name="수어삭제", description="[관리자] 잘못 저장된 수어 단어를 삭제합니다.")
     @app_commands.describe(단어명="삭제할 단어명 (입력하면 후보가 자동으로 뜹니다)")
-    @app_commands.checks.has_permissions(administrator=True)
+    @bot_admin_only()                                         # 2차: 봇 관리자 목록
+    @app_commands.checks.has_permissions(administrator=True)  # 1차: 서버 관리자 권한
     async def delete_sign(self, interaction: discord.Interaction, 단어명: str) -> None:
         await interaction.response.defer(ephemeral=True)  # ← 3초 타임아웃 방지
 
@@ -304,41 +349,52 @@ class Admin(commands.Cog, name="관리"):
 
     # ── /수어목록 ────────────────────────────────────────────────
     @app_commands.command(name="수어목록", description="[관리자] 저장된 수어 단어를 확인합니다.")
-    @app_commands.describe(검색="비워 두면 전체 목록에서 앞부분을 보여 줍니다.")
+    @app_commands.describe(검색="비워 두면 전체 목록을 10개씩 넘겨 볼 수 있어요.")
     @app_commands.checks.has_permissions(administrator=True)
     async def list_signs(self, interaction: discord.Interaction, 검색: str = "") -> None:
         await interaction.response.defer(ephemeral=True)  # ← 3초 타임아웃 방지
 
-        words = await self.db.search_words(검색.strip(), limit=50)
-        total = await self.db.count_words()
-        distinct = await self.db.count_distinct_words()
-        if not words:
+        keyword = 검색.strip()
+        matched = await self.db.count_words_by_filter(keyword)  # 검색어가 비면 전체
+        total = await self.db.count_words()                     # 캐시
+        distinct = await self.db.count_distinct_words()         # 캐시
+        if matched == 0:
             await interaction.followup.send(
                 f"조건에 맞는 단어가 없어요! 📭 (전체 {total}개)", ephemeral=True
             )
             return
 
-        # 같은 단어명이 여러 개면 뜻 요약을 덧붙여 구분합니다. ('배' 같은 동음이의어)
-        counts: dict[str, int] = {}
-        for w in words:
-            counts[w["word_name"]] = counts.get(w["word_name"], 0) + 1
+        header = f"🔍 검색어 `{keyword}` · {matched}개 찾음\n\n" if keyword else ""
+        footer = f"전체 {total}개 (단어명 기준 {distinct}개)"
 
-        lines = []
-        for w in words:
-            line = f"• **{w['word_name']}** — {w['category']}"
-            if counts[w["word_name"]] > 1:
-                line += f" / {_summarize(w['meaning'])}"
-            lines.append(line)
+        async def render_page(page: int) -> discord.Embed:
+            """버튼을 누를 때마다 그 페이지의 10개만 DB에서 가져옵니다."""
+            offset = page * LIST_PAGE_SIZE
+            words = await self.db.search_words_by_filter(
+                keyword, limit=LIST_PAGE_SIZE, offset=offset
+            )
+            # 같은 단어명이 여러 개면 뜻 요약을 덧붙여 구분합니다. ('배' 같은 동음이의어)
+            # 페이지 경계에 걸려 나뉘어도 알 수 있도록 DB 전체 기준으로 확인합니다.
+            homonyms = await self.db.get_homonym_names([w["word_name"] for w in words])
 
-        embed = discord.Embed(
-            title="📚 저장된 수어 단어",
-            description=_clip("\n".join(lines), 4000),
-            color=COLOR_ADMIN,
-        )
-        embed.set_footer(
-            text=f"{len(words)}개 표시 / 전체 {total}개 (단어명 기준 {distinct}개)"
-        )
-        await interaction.followup.send(embed=embed, ephemeral=True)
+            lines = []
+            for number, w in enumerate(words, start=offset + 1):
+                line = f"`{number}.` **{w['word_name']}** — {w['category']}"
+                if w["word_name"] in homonyms:
+                    line += f" / {_summarize(w['meaning'])}"
+                lines.append(line)
+
+            body = "\n".join(lines) or "이 페이지의 단어가 방금 삭제되었어요 🥲"
+            embed = discord.Embed(
+                title="📚 저장된 수어 단어",
+                description=_clip(header + body, 4000),
+                color=COLOR_ADMIN,
+            )
+            embed.set_footer(text=footer)
+            return embed
+
+        view = SignPaginatorView(interaction.user, page_count(matched, LIST_PAGE_SIZE), render_page)
+        await view.start(interaction, ephemeral=True)
 
     # ── 공통 에러 처리 ───────────────────────────────────────────
     async def cog_app_command_error(
@@ -348,6 +404,8 @@ class Admin(commands.Cog, name="관리"):
 
         if isinstance(error, app_commands.MissingPermissions):
             msg = "이 명령어는 서버 관리자만 사용할 수 있어요! 🔒"
+        elif isinstance(error, NotBotAdmin):
+            msg = "이 명령어는 등록된 봇 관리자만 사용할 수 있어요! 🔐"
         elif isinstance(original, discord.NotFound) and original.code == 10062:
             log.warning("만료된 상호작용 (10062): %s", interaction.command)
             return
