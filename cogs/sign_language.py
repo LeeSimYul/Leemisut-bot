@@ -10,7 +10,9 @@ cogs/sign_language.py
    - 영상·사전 링크는 임베드 안에서 마스크 링크([보이는 글](주소))로만 보여 줍니다.
 ■ 정답 은닉 원칙
    사전 상세 페이지는 주소를 누르면 단어명이 보이므로 퀴즈가 끝난 뒤에만 붙입니다.
-■ 모든 슬래시 명령어는 시작 직후 defer()로 응답을 미뤄 3초 타임아웃(10062)을 막습니다.
+■ 모든 슬래시 명령어는 시작 직후 safe_defer() 로 응답을 미룹니다.
+   3초 타임아웃(10062)을 막고, 이미 응답된 상호작용이면 이중 응답 없이 조용히 끝냅니다.
+   (같은 토큰으로 여러 PC·프로세스를 켜 두면 하나의 상호작용을 여러 봇이 함께 받습니다)
 ■ /수어검색 결과가 여러 개면 5개씩 페이지 버튼(◀ 이전 · 1 / N · ▶ 다음)으로 넘겨 봅니다.
    (공용 컴포넌트: utils/paginator.py)
 ■ /수어퀴즈 는 30% 확률로 '틀린 뒤 아직 못 맞힌 단어'를 정답으로 내는 복습 문제를 냅니다.
@@ -22,6 +24,7 @@ cogs/sign_language.py
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import random
 import re
@@ -86,6 +89,45 @@ COLOR_BOOKMARK = discord.Color.from_rgb(122, 198, 160)
 
 def today_kst() -> date:
     return datetime.now(KST).date()
+
+
+def command_name(interaction: discord.Interaction) -> str:
+    """로그에 남길 명령어 이름."""
+    return interaction.command.qualified_name if interaction.command else "알 수 없음"
+
+
+async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = False) -> bool:
+    """
+    응답을 미루고(defer), 명령을 계속 처리해도 되면 True 를 돌려줍니다.
+
+    ⚠️ 같은 봇 토큰으로 여러 PC·프로세스를 켜 두면 하나의 상호작용을 여러 봇이 함께 받아
+       먼저 응답한 쪽만 성공하고 나머지는 실패합니다. 아래 세 경우가 그때 나타나는데,
+       우리가 더 할 수 있는 일이 없으므로 오류 로그를 남기지 않고 조용히 False 를 돌려줍니다.
+         - is_done()                  : 이미 응답된 상호작용 (다른 프로세스·앞선 호출이 처리함)
+         - discord.NotFound (10062)   : 3초가 지나 만료됐거나 다른 세션이 먼저 응답함
+         - discord.InteractionResponded : 같은 상호작용에 이미 응답함
+       False 를 받으면 명령어는 아무 메시지도 보내지 말고 곧바로 return 해야 합니다.
+       (여기서 굳이 followup 을 보내면 그것도 10062 로 실패합니다)
+
+    ephemeral 은 defer 단계에서 정해집니다. 여기서 True 로 미뤄야 뒤따르는 followup.send 도
+    본인에게만 보이는 메시지로 나갑니다.
+    """
+    if interaction.response.is_done():
+        log.debug("이미 응답된 상호작용이라 건너뜁니다. (command=%s)", command_name(interaction))
+        return False
+
+    try:
+        await interaction.response.defer(ephemeral=ephemeral)
+        return True
+    except discord.NotFound as error:
+        # 10062 Unknown interaction - 봇이 중복 실행 중인지 확인해 주세요.
+        log.debug(
+            "만료된 상호작용입니다. (command=%s, code=%s)", command_name(interaction), error.code
+        )
+        return False
+    except discord.InteractionResponded:
+        log.debug("다른 곳에서 이미 응답했습니다. (command=%s)", command_name(interaction))
+        return False
 
 
 def _row_get(row: aiosqlite.Row, key: str, default: str = "") -> str:
@@ -299,7 +341,10 @@ class SignQuizView(discord.ui.View):
     async def handle_answer(self, interaction: discord.Interaction, chosen: QuizChoiceButton) -> None:
         # 버튼 연타로 보상이 두 번 들어가는 것 방지 (await 전에 플래그를 세움)
         if self.answered:
-            await interaction.response.defer()
+            # 이미 채점이 끝난 문제라 버튼만 조용히 풀어 줍니다.
+            # (만료·중복 응답이면 할 수 있는 일이 없으므로 그냥 넘어갑니다)
+            with contextlib.suppress(discord.HTTPException, discord.InteractionResponded):
+                await interaction.response.defer()
             return
         self.answered = True
         self.stop()
@@ -348,7 +393,13 @@ class SignQuizView(discord.ui.View):
             )
 
         self._finish_embed()
-        await interaction.response.edit_message(embed=self.embed, view=self)
+        # 비공개(ephemeral) 메시지를 '그 자리에서' 고치므로 결과도 본인에게만 보입니다.
+        # 만료(10062)되었거나 다른 프로세스가 먼저 응답했어도 채점·보상은 이미 DB에 반영된 뒤라,
+        # 오류 화면을 띄우지 않고 조용히 넘어갑니다.
+        try:
+            await interaction.response.edit_message(embed=self.embed, view=self)
+        except (discord.NotFound, discord.InteractionResponded):
+            log.debug("채점 화면을 갱신하지 못했습니다. (만료되었거나 이미 응답됨)")
 
     async def on_timeout(self) -> None:
         if self.answered:
@@ -432,7 +483,9 @@ class SignLanguage(commands.Cog, name="수어"):
     )
     @app_commands.checks.cooldown(1, COOLDOWN_SECONDS)
     async def daily_sign(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer()  # ← 3초 타임아웃 방지 (공개 메시지)
+        # 공개 메시지. 중복 응답·만료(10062)면 아무것도 하지 않고 끝냅니다.
+        if not await safe_defer(interaction):
+            return
 
         today = today_kst()
         # 유저마다 다른 단어를 배정합니다. (유저 ID + 날짜) % 전체 단어 수
@@ -485,7 +538,9 @@ class SignLanguage(commands.Cog, name="수어"):
     async def search_sign(
         self, interaction: discord.Interaction, 단어명: str = "", 분류: str = ""
     ) -> None:
-        await interaction.response.defer()  # ← 3초 타임아웃 방지
+        # 공개 메시지. 중복 응답·만료(10062)면 아무것도 하지 않고 끝냅니다.
+        if not await safe_defer(interaction):
+            return
 
         keyword, category = 단어명.strip(), 분류.strip()
         if not keyword and not category:
@@ -588,7 +643,9 @@ class SignLanguage(commands.Cog, name="수어"):
     @app_commands.checks.cooldown(1, COOLDOWN_SECONDS)
     async def sign_quiz(self, interaction: discord.Interaction) -> None:
         # 퀴즈 카드는 부른 사람에게만 보여 채널 도배를 막습니다. (ephemeral)
-        await interaction.response.defer(ephemeral=True)  # ← 3초 타임아웃 방지
+        # 여기서 ephemeral=True 로 미뤄야 아래 followup.send 도 모두 비공개로 나갑니다.
+        if not await safe_defer(interaction, ephemeral=True):
+            return
 
         # 30% 확률로 '틀린 뒤 아직 못 맞힌 단어'에서 정답을 고릅니다. (오답 복습)
         answer = await self._pick_review_answer(interaction.user.id)
@@ -674,7 +731,9 @@ class SignLanguage(commands.Cog, name="수어"):
     async def bookmark_save(
         self, interaction: discord.Interaction, 단어명: app_commands.Range[str, 1, 100]
     ) -> None:
-        await interaction.response.defer(ephemeral=True)  # ← 3초 타임아웃 방지 (나만 보이게)
+        # 나만 보이는 메시지. 중복 응답·만료(10062)면 아무것도 하지 않고 끝냅니다.
+        if not await safe_defer(interaction, ephemeral=True):
+            return
 
         word = await self._resolve_bookmark_word(interaction, 단어명)
         if word is None:
@@ -757,7 +816,9 @@ class SignLanguage(commands.Cog, name="수어"):
     @app_commands.command(name="수어단어장", description="내 단어장에 담아 둔 수어 단어를 모아 봅니다.")
     @app_commands.checks.cooldown(1, COOLDOWN_SECONDS)
     async def bookmark_list(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)  # ← 3초 타임아웃 방지 (나만 보이게)
+        # 나만 보이는 메시지. 중복 응답·만료(10062)면 아무것도 하지 않고 끝냅니다.
+        if not await safe_defer(interaction, ephemeral=True):
+            return
 
         words = await self.db.get_user_bookmarks(interaction.user.id)
         if not words:

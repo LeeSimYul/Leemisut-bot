@@ -32,6 +32,7 @@ class ImisutBot(commands.Bot):
         intents.members = True          # 특권 인텐트
         super().__init__(command_prefix="!", intents=intents)
         self.db = Database(DB_PATH)
+        self.ready_count = 0  # on_ready 실행 횟수 (첫 접속인지 재접속인지 구분용)
 
     async def setup_hook(self) -> None:
         """로그인 직후, 게이트웨이 접속 전에 딱 한 번 실행됩니다."""
@@ -67,8 +68,42 @@ class ImisutBot(commands.Bot):
             log.exception("❌ 슬래시 명령어 동기화 실패")
 
     async def on_ready(self) -> None:
-        name = self.user.name if self.user else "이미숫"
+        """
+        접속이 끝날 때마다 실행됩니다. (첫 접속 + 끊겼다 붙는 재접속)
+
+        같은 토큰으로 여러 PC·프로세스에서 봇을 켜 두면 하나의 상호작용을 여러 봇이 함께 받아
+        /명령어가 10062(만료된 상호작용)로 실패합니다. 콘솔만 보고도 '지금 이 창이 어느 봇이고
+        몇 번째 접속인지' 바로 알 수 있도록 신원을 또렷하게 남깁니다.
+        """
+        self.ready_count += 1
+        user = self.user
+        name = user.name if user else "이미숫"
+
         log.info("✨ 수어 연구학 조교 %s(이)가 성공적으로 디스코드에 접속했습니다!", name)
+        log.info(
+            "🆔 로그인 계정: %s (User ID: %s) · Application ID: %s",
+            user,
+            user.id if user else "?",
+            self.application_id,
+        )
+        log.info(
+            "🖥️ 프로세스 PID: %s · 게이트웨이 세션: %s · 참여 서버: %d곳",
+            os.getpid(),
+            getattr(self.ws, "session_id", "?"),
+            len(self.guilds),
+        )
+
+        if self.ready_count == 1:
+            log.info(
+                "☝️ 봇은 한 번에 한 곳에서만 켜 주세요. 다른 PC나 터미널에서 같은 토큰으로 또 켜면 "
+                "슬래시 명령어가 10062 오류로 실패할 수 있습니다."
+            )
+        else:
+            log.warning(
+                "🔁 이 프로세스에서 %d번째 접속입니다. 잠깐 끊겼다 붙은 재접속이면 정상이지만, "
+                "자주 반복되면 다른 곳에서도 같은 토큰으로 봇이 켜져 있는지 확인해 주세요.",
+                self.ready_count,
+            )
 
     async def close(self) -> None:
         try:
