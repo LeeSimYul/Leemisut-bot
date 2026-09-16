@@ -21,6 +21,8 @@ from discord import app_commands
 from discord.ext import commands
 
 from database import Database
+# 일일 보상 상한선은 퀴즈 기능(cogs/sign_language.py)에서 한 번만 정의해 함께 씁니다.
+from cogs.sign_language import MAX_DAILY_QUIZ_REWARDS
 
 log = logging.getLogger(__name__)
 
@@ -155,7 +157,7 @@ HELP_TEXT = (
     "\n**📜 표현력 향상**\n"
     "`/명언` 또는 `/격언` — 한 문장을 수어로 어떻게 옮길지 생각하기\n"
     "\n**👤 개인 프로필**\n"
-    "`/내정보` — 내 레벨 · 포인트 · 연속 출석일 확인"
+    "`/내정보` — 내 레벨 · 포인트 · 연속 출석일 · 오늘 퀴즈 보상 확인"
 )
 
 # /내정보 설정
@@ -210,7 +212,12 @@ def streak_text(user: aiosqlite.Row | None, today: date) -> str:
 
 
 def build_profile_embed(
-    name: str, avatar_url: str | None, user: aiosqlite.Row | None, bookmark_count: int, today: date
+    name: str,
+    avatar_url: str | None,
+    user: aiosqlite.Row | None,
+    bookmark_count: int,
+    quiz_rewards_today: int,
+    today: date,
 ) -> discord.Embed:
     """/내정보 임베드. 아직 한 번도 활동하지 않은 유저(user=None)는 0으로 보여 줍니다."""
     exp = user["exp"] if user else 0
@@ -239,6 +246,13 @@ def build_profile_embed(
         name="📚 단어장",
         value=f"**{bookmark_count}**개 저장 중\n"
               + ("`/수어단어장` 에서 보기" if bookmark_count else "`/단어장저장` 으로 담아 보세요"),
+        inline=True,
+    )
+    remaining = max(0, MAX_DAILY_QUIZ_REWARDS - quiz_rewards_today)
+    embed.add_field(
+        name="🎯 오늘 퀴즈 보상",
+        value=f"**{quiz_rewards_today}** / {MAX_DAILY_QUIZ_REWARDS}회\n"
+              + (f"**{remaining}**회 더 받을 수 있어요" if remaining else "오늘은 다 받았어요! 🌙"),
         inline=True,
     )
     embed.set_footer(text="경험치는 /오늘의수어 출석과 /수어퀴즈 정답으로 쌓여요 🤟")
@@ -280,15 +294,21 @@ class General(commands.Cog, name="기본"):
         await interaction.response.defer()  # ← 3초 타임아웃 방지
 
         user_id = interaction.user.id
+        today = datetime.now(KST).date()
         user = await self.db.get_user(user_id)  # 한 번도 활동 안 했으면 None (새로 만들지 않음)
         bookmarks = await self.db.get_user_bookmarks(user_id)
+        # 오늘 퀴즈 보상을 몇 번 받았는지 (상한선을 넘긴 정답도 기록에는 남으므로 잘라서 표시)
+        quiz_rewards_today = min(
+            await self.db.get_today_quiz_reward_count(user_id, today), MAX_DAILY_QUIZ_REWARDS
+        )
 
         embed = build_profile_embed(
             interaction.user.display_name,
             interaction.user.display_avatar.url,
             user,
             len(bookmarks),
-            datetime.now(KST).date(),
+            quiz_rewards_today,
+            today,
         )
         await interaction.followup.send(embed=embed)
 

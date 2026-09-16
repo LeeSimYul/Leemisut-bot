@@ -16,6 +16,7 @@ database.py
       → '배(사물)'과 '배(신체)'처럼 영상이 다르면 각각 저장됩니다.
 
 ■ quiz_logs      퀴즈 풀이 기록 (log_id, user_id, word_id, is_correct, solved_at)
+    → 정답(is_correct=1) 기록 수로 '오늘 받은 퀴즈 보상 횟수'(일일 상한선)를 셉니다.
 ■ user_bookmarks 나만의 단어장   (user_id, word_id, created_at)  UNIQUE(user_id, word_id)
     → 두 테이블 모두 sign_words 와 JOIN 해서 읽으므로 삭제된 단어는 자동으로 빠집니다.
     → 기존 DB에도 봇을 켤 때 CREATE TABLE IF NOT EXISTS 로 자동 추가됩니다. (기존 데이터 유지)
@@ -30,7 +31,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Awaitable, Callable
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -39,6 +40,10 @@ import aiosqlite
 log = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+# 하루 경계를 따질 때 쓰는 시간대. cogs 와 같은 고정 오프셋을 씁니다.
+# (quiz_logs.solved_at 은 UTC 로 남으므로, KST 하루를 UTC 구간으로 바꿔 조회합니다)
+KST = timezone(timedelta(hours=9))
 
 # LIKE 검색어 최대 길이. 수어 단어명은 길어야 20자 안팎이라 넉넉한 값입니다.
 # 패턴이 길수록 행마다 비교 비용이 커지므로 이보다 긴 입력은 잘라서 씁니다.
@@ -602,6 +607,111 @@ class Database:
             (user_id, word_id, int(is_correct), _now_iso()),
         )
         await self.conn.commit()
+
+    @staticmethod
+    def _kst_day_bounds(today: date) -> tuple[str, str]:
+        """
+        KST 하루(00:00~24:00)를 quiz_logs.solved_at 과 비교할 UTC 문자열 구간으로 바꿉니다.
+
+        solved_at 은 UTC ISO 8601 문자열이고 _now_iso() 가 늘 같은 형식('+00:00', 초 단위)으로
+        남기므로, 사전순 문자열 비교만으로도 정확히 하루를 잘라낼 수 있습니다.
+        """
+        day_start_kst = datetime(today.year, today.month, today.day, tzinfo=KST)
+        start_utc = day_start_kst.astimezone(timezone.utc).isoformat(timespec="seconds")
+        end_utc = (day_start_kst + timedelta(days=1)).astimezone(timezone.utc).isoformat(
+            timespec="seconds"
+        )
+        return start_utc, end_utc
+
+    async def get_today_quiz_reward_count(self, user_id: int, today: date) -> int:
+        """
+        오늘(KST 기준) 퀴즈 정답으로 보상을 받은 횟수를 셉니다.
+        (/내정보 표시용. 보상 지급 판단은 record_quiz_reward 안에서 원자적으로 합니다)
+
+        보상은 하루 중 먼저 맞힌 문제부터 순서대로 나가므로,
+        '오늘의 정답 기록 수' 가 곧 '오늘 받은 보상 횟수' 입니다.
+        (상한을 넘긴 뒤의 정답도 기록은 남으므로, 표시할 때는 상한으로 잘라 주세요)
+        """
+        start_utc, end_utc = self._kst_day_bounds(today)
+        async with self.conn.execute(
+            """
+            SELECT COUNT(*) FROM quiz_logs
+            WHERE user_id = ? AND is_correct = 1
+              AND solved_at >= ? AND solved_at < ?
+            """,
+            (user_id, start_utc, end_utc),
+        ) as cur:
+            (count,) = await cur.fetchone()
+        return int(count)
+
+    async def record_quiz_reward(
+        self,
+        user_id: int,
+        word_id: int,
+        today: date,
+        *,
+        points: int,
+        exp: int,
+        max_daily_rewards: int,
+    ) -> tuple[bool, int, aiosqlite.Row | None]:
+        """
+        퀴즈 정답을 기록하고, 일일 상한선 안에서만 보상을 지급합니다.
+
+        ■ 동시성(Race Condition) 방지
+          '파이썬에서 횟수를 세고 → 보상을 준다' 로 나누면 그 사이에 다른 퀴즈가 끼어들어
+          상한을 넘겨 지급될 수 있습니다. 그래서 횟수 확인을 UPDATE 문의 WHERE 안에 넣어
+          '확인과 지급'을 한 문장에서 끝냅니다.
+          기준은 시간이 아니라 방금 남긴 기록의 log_id 입니다.
+            - 내 기록보다 '앞선' 오늘 정답 수가 상한 미만일 때만 지급
+            - 두 문제를 같은 순간에 맞혀도 log_id 순서로 줄이 서므로,
+              중복 지급도, 둘 다 막히는 일도 없습니다.
+
+        반환: (보상 지급 여부, 오늘 사용한 보상 횟수, 최신 유저 정보 or None)
+        """
+        start_utc, end_utc = self._kst_day_bounds(today)
+
+        cur = await self.conn.execute(
+            "INSERT INTO quiz_logs (user_id, word_id, is_correct, solved_at) VALUES (?, ?, 1, ?)",
+            (user_id, word_id, _now_iso()),
+        )
+        log_id = cur.lastrowid
+
+        # 유저 행이 없을 수도 있으니 먼저 만들어 둡니다. (보상은 아래 UPDATE 에서만 나갑니다)
+        await self.conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        cur = await self.conn.execute(
+            """
+            UPDATE users SET
+                points = points + ?,
+                exp    = exp + ?
+            WHERE user_id = ?
+              AND (SELECT COUNT(*) FROM quiz_logs
+                   WHERE user_id = ? AND is_correct = 1
+                     AND solved_at >= ? AND solved_at < ?
+                     AND log_id < ?) < ?
+            """,
+            (points, exp, user_id, user_id, start_utc, end_utc, log_id, max_daily_rewards),
+        )
+        granted = cur.rowcount > 0
+        await self.conn.commit()
+
+        # 표시용 횟수도 log_id 기준으로 셉니다. ('내 앞의 정답 수 + 1' = 내 차례)
+        # log_id 는 계속 커지기만 하므로, 동시에 여러 문제를 풀어도 이 값은 흔들리지 않습니다.
+        # (전체 개수를 다시 세면 같은 순간의 다른 풀이까지 들어가 모두 같은 숫자로 보입니다)
+        async with self.conn.execute(
+            """
+            SELECT COUNT(*) FROM quiz_logs
+            WHERE user_id = ? AND is_correct = 1
+              AND solved_at >= ? AND solved_at < ?
+              AND log_id < ?
+            """,
+            (user_id, start_utc, end_utc, log_id),
+        ) as cur:
+            (earlier,) = await cur.fetchone()
+
+        # 상한을 넘긴 뒤의 정답도 기록에는 남으므로, 막힌 경우에는 상한값으로 보여 줍니다.
+        used = earlier + 1 if granted else max_daily_rewards
+        user = await self.get_user(user_id) if granted else None
+        return granted, used, user
 
     async def get_user_wrong_words(self, user_id: int, limit: int = 10) -> list[aiosqlite.Row]:
         """

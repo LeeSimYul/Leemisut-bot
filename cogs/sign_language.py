@@ -15,6 +15,9 @@ cogs/sign_language.py
    (공용 컴포넌트: utils/paginator.py)
 ■ /수어퀴즈 는 30% 확률로 '틀린 뒤 아직 못 맞힌 단어'를 정답으로 내는 복습 문제를 냅니다.
    풀이 결과(정답 · 오답 · 시간 초과)는 모두 quiz_logs 에 기록됩니다.
+■ 퀴즈 카드·버튼·채점 결과는 명령어를 부른 본인에게만 보입니다. (ephemeral · 채널 도배 방지)
+■ 퀴즈 보상은 하루 MAX_DAILY_QUIZ_REWARDS 회까지만 지급합니다.
+   상한을 채운 뒤에도 문제 풀이와 학습 기록(quiz_logs)은 제한 없이 계속됩니다.
 ■ /단어장저장 · /수어단어장 으로 나만의 단어장을 관리합니다. (본인에게만 보이는 메시지)
 """
 from __future__ import annotations
@@ -41,6 +44,9 @@ QUIZ_CHOICES = 4
 QUIZ_TIMEOUT = 45  # 초
 REWARD_POINTS = 10
 REWARD_EXP = 10
+# 포인트 어뷰징 방지: 하루에 퀴즈 보상을 받을 수 있는 최대 횟수 (10회 = 최대 100pt / 100exp)
+# 상한을 채워도 퀴즈 풀이·오답 복습 기록은 제한 없이 계속 쌓입니다.
+MAX_DAILY_QUIZ_REWARDS = 10
 DAILY_POINTS = 5   # /오늘의수어 출석 보상
 DAILY_EXP = 5
 SEARCH_PAGE_SIZE = 5    # /수어검색 결과 목록 한 페이지에 보여 줄 건수
@@ -301,21 +307,37 @@ class SignQuizView(discord.ui.View):
 
         name = self.answer["word_name"]
         is_correct = chosen.word_id == self.answer["word_id"]
-        await self._record(is_correct)  # 오답 복습용 기록 (실패해도 채점은 계속합니다)
+        # 기록과 보상을 한 번에 처리합니다. (상한선 확인은 DB 안에서 원자적으로 이뤄집니다)
+        granted, used_today, user = await self._record(is_correct)
 
         if is_correct:
-            user = await self.db.add_reward(interaction.user.id, REWARD_POINTS, REWARD_EXP)
             self.embed.color = COLOR_CORRECT
             self.embed.title = f"🎉 정답이에요! — {name} [{self.answer['category']}]"
             praise = (
                 "🎓 **복습 성공!** 전에 틀렸던 단어를 이번엔 맞히셨어요."
                 if self.is_review else "눈썰미가 대단하시네요 👏"
             )
-            self.embed.description = (
-                f"{praise}\n"
-                f"✨ 포인트 **+{REWARD_POINTS}** · 경험치 **+{REWARD_EXP}**\n"
-                f"현재 포인트 {user['points']} · 경험치 {user['exp']}"
-            )
+            if granted and user is not None:
+                reward_line = (
+                    f"✨ 포인트 **+{REWARD_POINTS}** · 경험치 **+{REWARD_EXP}** "
+                    f"(오늘 보상 {used_today}/{MAX_DAILY_QUIZ_REWARDS}회)\n"
+                    f"현재 포인트 {user['points']} · 경험치 {user['exp']}"
+                )
+            elif used_today < 0:
+                # DB 오류로 기록조차 남기지 못한 경우 (상한선과 무관) - 솔직하게 알려 줍니다.
+                reward_line = (
+                    "⚠️ 기록을 저장하지 못해 이번에는 보상을 드리지 못했어요.\n"
+                    "잠시 후 다시 도전해 주세요!"
+                )
+            else:
+                # 상한선 도달: 보상은 0이지만 학습 기록은 _record 에서 이미 남겼습니다.
+                reward_line = (
+                    f"🎯 오늘의 퀴즈 보상 상한선"
+                    f"({MAX_DAILY_QUIZ_REWARDS}/{MAX_DAILY_QUIZ_REWARDS}회)에 달성하여 "
+                    "보상 없이 학습 기록만 남습니다.\n"
+                    "내일 다시 도전하면 보상을 받을 수 있어요! 🌙"
+                )
+            self.embed.description = f"{praise}\n{reward_line}"
         else:
             self.embed.color = COLOR_WRONG
             self.embed.title = f"😅 아쉬워요! — 정답은 {name} [{self.answer['category']}]"
@@ -348,18 +370,31 @@ class SignQuizView(discord.ui.View):
             except discord.HTTPException:
                 pass  # 메시지가 삭제된 경우 등
 
-    async def _record(self, is_correct: bool) -> None:
+    async def _record(self, is_correct: bool) -> tuple[bool, int, aiosqlite.Row | None]:
         """
-        풀이 결과를 quiz_logs 에 남깁니다.
-        기록은 부가 기능이라, 실패해도 로그만 남기고 채점 화면은 그대로 보여 줍니다.
+        풀이 결과를 quiz_logs 에 남기고, 정답이면 일일 상한선 안에서 보상까지 처리합니다.
         (handle_answer · on_timeout 모두 answered 플래그 뒤에서 불러 한 문제에 한 번만 기록)
+
+        반환: (보상 지급 여부, 오늘 사용한 보상 횟수, 최신 유저 정보)
+              DB 오류로 기록하지 못하면 (False, -1, None) - 상한선 도달과 구분하기 위한 값입니다.
         """
         try:
-            await self.db.log_quiz_attempt(self.owner.id, self.answer["word_id"], is_correct)
+            if is_correct:
+                return await self.db.record_quiz_reward(
+                    self.owner.id,
+                    self.answer["word_id"],
+                    today_kst(),
+                    points=REWARD_POINTS,
+                    exp=REWARD_EXP,
+                    max_daily_rewards=MAX_DAILY_QUIZ_REWARDS,
+                )
+            await self.db.log_quiz_attempt(self.owner.id, self.answer["word_id"], False)
+            return False, 0, None
         except Exception:
             log.exception(
                 "퀴즈 기록 저장 실패 (user=%s, word=%s)", self.owner.id, self.answer["word_id"]
             )
+            return False, -1, None
 
     def _finish_embed(self) -> None:
         """정답 공개 후에만 설명 전문과 링크를 붙입니다."""
@@ -552,7 +587,8 @@ class SignLanguage(commands.Cog, name="수어"):
     @app_commands.command(name="수어퀴즈", description="수어 동작을 보고 알맞은 단어를 골라 보세요!")
     @app_commands.checks.cooldown(1, COOLDOWN_SECONDS)
     async def sign_quiz(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer()  # ← 3초 타임아웃 방지
+        # 퀴즈 카드는 부른 사람에게만 보여 채널 도배를 막습니다. (ephemeral)
+        await interaction.response.defer(ephemeral=True)  # ← 3초 타임아웃 방지
 
         # 30% 확률로 '틀린 뒤 아직 못 맞힌 단어'에서 정답을 고릅니다. (오답 복습)
         answer = await self._pick_review_answer(interaction.user.id)
@@ -600,12 +636,19 @@ class SignLanguage(commands.Cog, name="수어"):
         video_link = masked("🎬 영상으로 문제 보기", answer["video_url"])
         if video_link:
             embed.add_field(name="문제 영상", value=video_link, inline=False)
-        embed.set_footer(text=f"정답 시 포인트 +{REWARD_POINTS} · 경험치 +{REWARD_EXP}")
+        embed.set_footer(
+            text=f"정답 시 포인트 +{REWARD_POINTS} · 경험치 +{REWARD_EXP}"
+                 f" · 보상은 하루 {MAX_DAILY_QUIZ_REWARDS}회까지"
+        )
 
         view = SignQuizView(self.db, interaction.user, answer, choices, embed, is_review=is_review)
         # wait=True 를 줘야 메시지 객체가 돌아옵니다 (시간 초과 시 수정에 필요)
+        # ephemeral=True 로 보내도 채점 화면까지 계속 비공개로 유지됩니다.
+        #   - 버튼 클릭: interaction.response.edit_message() 가 같은 비공개 메시지를 고침
+        #   - 시간 초과: 여기서 받은 WebhookMessage.edit() 가 상호작용 토큰으로 같은 메시지를 고침
+        #     (토큰 유효 15분 > QUIZ_TIMEOUT 45초라 안전)
         view.message = await interaction.followup.send(
-            content=content, embed=embed, view=view, wait=True
+            content=content, embed=embed, view=view, ephemeral=True, wait=True
         )
 
     async def _pick_review_answer(self, user_id: int) -> aiosqlite.Row | None:
