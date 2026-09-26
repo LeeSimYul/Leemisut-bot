@@ -15,12 +15,11 @@ import random
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
-import aiosqlite
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from database import Database
+from database import Database, Row
 # 일일 보상 상한선은 퀴즈 기능(cogs/sign_language.py)에서 한 번만 정의해 함께 씁니다.
 from cogs.sign_language import MAX_DAILY_QUIZ_REWARDS
 
@@ -196,7 +195,7 @@ def level_progress(exp: int) -> tuple[int, int]:
     return exp // EXP_PER_LEVEL + 1, exp % EXP_PER_LEVEL
 
 
-def streak_text(user: aiosqlite.Row | None, today: date) -> str:
+def streak_text(user: Row | None, today: date) -> str:
     """
     연속 출석 표시. DB 의 streak 은 출석할 때만 바뀌므로 마지막 출석일을 함께 봅니다.
     (/오늘의수어 와 같은 규칙: 어제 출석했으면 이어지고, 그보다 오래됐으면 끊긴 것)
@@ -214,7 +213,7 @@ def streak_text(user: aiosqlite.Row | None, today: date) -> str:
 def build_profile_embed(
     name: str,
     avatar_url: str | None,
-    user: aiosqlite.Row | None,
+    user: Row | None,
     bookmark_count: int,
     quiz_rewards_today: int,
     today: date,

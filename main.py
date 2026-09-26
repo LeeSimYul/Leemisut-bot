@@ -37,7 +37,8 @@ class ImisutBot(commands.Bot):
     async def setup_hook(self) -> None:
         """로그인 직후, 게이트웨이 접속 전에 딱 한 번 실행됩니다."""
         await self.db.connect()
-        log.info("🗄️ DB 연결 완료: %s", self.db.path)
+        # 클라우드(PostgreSQL)인지 로컬 파일(SQLite)인지 콘솔에서 바로 알 수 있게 남깁니다.
+        log.info("🗄️ DB 연결 완료: %s", self.db.describe())
         await self.load_cogs()
         await self.sync_commands()
 

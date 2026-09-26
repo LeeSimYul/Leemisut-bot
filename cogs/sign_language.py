@@ -31,12 +31,11 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
-import aiosqlite
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from database import Database
+from database import Database, Row
 from utils.paginator import SignPaginatorView, page_count
 
 log = logging.getLogger(__name__)
@@ -130,7 +129,7 @@ async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = Fals
         return False
 
 
-def _row_get(row: aiosqlite.Row, key: str, default: str = "") -> str:
+def _row_get(row: Row, key: str, default: str = "") -> str:
     """예전 DB에 없는 컬럼(image_url, detail_url)을 안전하게 읽습니다."""
     try:
         value = row[key]
@@ -151,7 +150,7 @@ def is_video_url(url: str) -> bool:
     return _is_http(url) and urlsplit(url).path.lower().endswith(VIDEO_EXTENSIONS)
 
 
-def has_quiz_media(word: aiosqlite.Row) -> bool:
+def has_quiz_media(word: Row) -> bool:
     """퀴즈 문제로 보여 줄 수형 사진이나 영상이 있는지 확인합니다."""
     return is_image_url(_row_get(word, "image_url")) or is_video_url(word["video_url"])
 
@@ -214,7 +213,7 @@ def set_media(embed: discord.Embed, image_url: str, video_url: str) -> str | Non
     return None
 
 
-def link_field_value(word: aiosqlite.Row, *, include_detail: bool) -> str:
+def link_field_value(word: Row, *, include_detail: bool) -> str:
     """영상·사전 링크를 한 줄로 모읍니다."""
     links = [masked("🎬 수어 영상", word["video_url"])]
     if include_detail:
@@ -223,7 +222,7 @@ def link_field_value(word: aiosqlite.Row, *, include_detail: bool) -> str:
 
 
 def build_word_embed(
-    word: aiosqlite.Row, *, title: str, color: discord.Color
+    word: Row, *, title: str, color: discord.Color
 ) -> tuple[discord.Embed, str | None]:
     """
     단어 하나를 자세히 보여 주는 임베드를 만듭니다. (/오늘의수어, /수어검색 공용)
@@ -242,7 +241,7 @@ def build_word_embed(
 
 
 def build_search_page_embed(
-    words: list[aiosqlite.Row], *, conditions: str, total: int, offset: int
+    words: list[Row], *, conditions: str, total: int, offset: int
 ) -> discord.Embed:
     """/수어검색 결과 목록의 한 페이지. (번호는 전체 결과 기준으로 이어서 매깁니다)"""
     lines = [
@@ -260,7 +259,7 @@ def build_search_page_embed(
 
 
 def build_bookmark_page_embed(
-    words: list[aiosqlite.Row], *, owner_name: str, total: int, offset: int
+    words: list[Row], *, owner_name: str, total: int, offset: int
 ) -> discord.Embed:
     """/수어단어장 한 페이지. 단어마다 영상·사전 링크를 붙여 바로 복습할 수 있게 합니다."""
     lines = []
@@ -296,8 +295,8 @@ class SignQuizView(discord.ui.View):
         self,
         db: Database,
         owner: discord.abc.User,
-        answer: aiosqlite.Row,
-        choices: list[aiosqlite.Row],
+        answer: Row,
+        choices: list[Row],
         embed: discord.Embed,
         *,
         is_review: bool = False,
@@ -421,7 +420,7 @@ class SignQuizView(discord.ui.View):
             except discord.HTTPException:
                 pass  # 메시지가 삭제된 경우 등
 
-    async def _record(self, is_correct: bool) -> tuple[bool, int, aiosqlite.Row | None]:
+    async def _record(self, is_correct: bool) -> tuple[bool, int, Row | None]:
         """
         풀이 결과를 quiz_logs 에 남기고, 정답이면 일일 상한선 안에서 보상까지 처리합니다.
         (handle_answer · on_timeout 모두 answered 플래그 뒤에서 불러 한 문제에 한 번만 기록)
@@ -708,7 +707,7 @@ class SignLanguage(commands.Cog, name="수어"):
             content=content, embed=embed, view=view, ephemeral=True, wait=True
         )
 
-    async def _pick_review_answer(self, user_id: int) -> aiosqlite.Row | None:
+    async def _pick_review_answer(self, user_id: int) -> Row | None:
         """
         REVIEW_PROBABILITY(30%) 확률로 오답 복습 문제의 정답을 고릅니다.
         오답 이력이 없거나, 보여 줄 미디어가 있는 오답이 없으면 None → 기존처럼 무작위 출제.
@@ -749,7 +748,7 @@ class SignLanguage(commands.Cog, name="수어"):
 
     async def _resolve_bookmark_word(
         self, interaction: discord.Interaction, raw: str
-    ) -> aiosqlite.Row | None:
+    ) -> Row | None:
         """
         입력값을 단어 한 건으로 바꿉니다. 못 정하면 안내를 보내고 None 을 돌려줍니다.
           - 자동완성 후보를 고르면 '#단어ID' 가 들어옵니다. (동음이의어도 정확히 구분)
