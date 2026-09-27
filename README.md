@@ -12,6 +12,7 @@
 ![discord.py](https://img.shields.io/badge/discord.py-2.4%2B-5865F2?logo=discord)
 ![Database](https://img.shields.io/badge/PostgreSQL-Supabase_%C2%B7_Neon-4169E1?logo=postgresql&logoColor=white)
 ![Fallback](https://img.shields.io/badge/Fallback-SQLite_WAL-003B57?logo=sqlite&logoColor=white)
+![Deploy](https://img.shields.io/badge/Oracle_Cloud-Always_Free_VM-F80000?logo=oracle&logoColor=white)
 ![License](https://img.shields.io/badge/Code_License-MIT-green.svg)
 ![Brand Copyright](https://img.shields.io/badge/Brand-CC%20BY--NC--ND%204.0-orange.svg)
 
@@ -84,6 +85,8 @@
   `discord.ui.View` 기반의 `◀ 이전 · 1 / N 페이지 · ▶ 다음` 버튼 컴포넌트입니다. 페이지는 필요할 때만 DB에서 불러오고(LIMIT/OFFSET) 한 번 본 페이지는 다시 쓰며, 명령어를 실행한 사람만 조작할 수 있고 마지막 조작 60초 뒤 버튼이 자동으로 잠깁니다. (`utils/paginator.py`)
 - **보안: 유저별 쿨다운 & 관리자 2중 검증**
   일반 명령어는 유저당 3초에 1회로 제한(Rate Limit)되고, 초과하면 본인에게만 안내가 보입니다. 관리자 명령어는 `has_permissions(administrator=True)` 와 `.env` 의 `ADMIN_USER_IDS` 를 함께 확인하며, 목록이 잘못 적혀 있으면 관리자 명령어가 잠기는 fail-closed 방식입니다. 목록 밖 사용자의 시도는 로그로 남습니다.
+- **끊겨도 스스로 돌아오는 상시 가동**
+  디스코드가 잠깐 5xx 를 돌려주거나 네트워크가 흔들려도 프로세스를 죽이지 않고 30초 → 60초 → … → 최대 10분 간격으로 다시 접속합니다. 토큰이 틀렸거나 특권 인텐트가 꺼진 것처럼 사람이 고쳐야 하는 문제는 무엇을 고쳐야 하는지 알리고 즉시 멈춥니다. DB 쪽도 오래 쉰 커넥션을 풀이 먼저 정리하고, 그래도 끊긴 커넥션을 잡으면 **조회에 한해** 한 번 다시 시도합니다. (쓰기를 다시 보내면 포인트가 두 번 지급될 수 있어 일부러 재시도하지 않습니다)
 - **개인화 학습 데이터**
   `quiz_logs`(퀴즈 풀이 기록)와 `user_bookmarks`(단어장) 테이블로 유저별 학습 이력을 관리합니다. 오답 복습은 '마지막 풀이가 오답인 단어'를 많이 틀린 순으로 골라 출제하며, 기존 DB는 봇 시작 시 데이터를 유지한 채 자동으로 마이그레이션됩니다.
 
@@ -92,6 +95,7 @@
 - **Framework**: `discord.py` v2.x (Slash Commands, Discord UI Components)
 - **Database**: `asyncpg` (Cloud PostgreSQL · Supabase / Neon) · `aiosqlite` (로컬 Fallback, WAL mode)
 - **Network / Config**: `aiohttp`, `python-dotenv`
+- **Infra**: Oracle Cloud Always Free Ubuntu VM (`systemd` 상시 서비스) · Supabase PostgreSQL
 - **Open API**: 국립국어원 한국수어사전 / 문화공공데이터광장 API
 > 본 프로젝트는 국립국어원(한국수어사전) 및 문화공공데이터광장의 Open API 데이터를 활용하여 제작되었습니다.
 
@@ -116,7 +120,9 @@ Leemisut-bot/
 └── requirements.txt
 ```
 
-## 🚀 실행 가이드
+## 🚀 실행 가이드 (로컬 · 개발용)
+
+> 🖥️ 실제 서버에서 24시간 돌리는 방법은 아래 [운영 환경](#️-운영-환경-oracle-cloud-vm) 을 봐 주세요.
 
 ### 0. 준비물
 - **Python 3.12 이상**
@@ -163,8 +169,8 @@ python main.py
 
 아래와 같은 로그가 보이면 정상입니다.
 ```text
-🗄️ DB 연결 완료: PostgreSQL db.xxxx.supabase.co:5432/postgres   ← 클라우드일 때
-🗄️ DB 연결 완료: SQLite 파일 .../data/imisut.db                 ← 로컬일 때
+🗄️ DB 연결 완료: SQLite 파일 .../data/imisut.db          ← DATABASE_URL 이 없을 때
+🗄️ DB 연결 완료: PostgreSQL db.xxxx.supabase.co:5432/postgres  ← 클라우드에 붙었을 때
 🧩 Cog 로드 완료: cogs.admin / cogs.general / cogs.sign_language
 🔗 전역 슬래시 명령어 N개 동기화
 ✨ 수어 연구학 조교 이미숫(이)가 성공적으로 디스코드에 접속했습니다!
@@ -174,6 +180,60 @@ python main.py
 1. 처음 실행하면 DB 테이블이 자동으로 만들어지고(로컬 모드면 `data/imisut.db` 파일까지) 테스트용 단어 4개가 들어갑니다.
 2. 관리자 계정으로 `/수어전체동기화` 를 실행하면 실제 수어 자료(약 3,700건)가 채워집니다.
 3. `DEV_GUILD_ID` 없이 전역으로 동기화하면 슬래시 명령어가 목록에 뜨기까지 최대 1시간쯤 걸릴 수 있습니다.
+
+## 🖥️ 운영 환경 (Oracle Cloud VM)
+
+실제 서비스는 **오라클 클라우드 Always Free 우분투 VM**에서 `systemd` 백그라운드 서비스로 24시간 돌고, 데이터는 **Supabase PostgreSQL**에 저장됩니다. 봇이 켜져 있는 컴퓨터와 데이터가 분리되어 있어, 서버를 옮기거나 다시 만들어도 포인트 · 출석 · 퀴즈 기록 · 단어장이 그대로 이어집니다.
+
+| 구분 | 구성 |
+|---|---|
+| 서버 | Oracle Cloud Always Free · Ubuntu (`~/Leemisut-bot`) |
+| 실행 | `systemd` 서비스 `leemisut` (부팅 시 자동 시작 · 비정상 종료 시 자동 재시작) |
+| 데이터베이스 | Supabase PostgreSQL (Session Pooler · 6543) |
+| 파이썬 | 저장소 안의 가상환경 `venv` |
+
+### 서버 업데이트 · 배포
+코드를 고쳐 GitHub `main` 에 올린 뒤, VM에서 **이 한 줄**이면 반영됩니다.
+
+```bash
+cd ~/Leemisut-bot && git pull && sudo systemctl restart leemisut
+```
+
+패키지가 늘었을 때만 중간에 설치를 한 번 끼워 주세요.
+
+```bash
+cd ~/Leemisut-bot && git pull && venv/bin/pip install -r requirements.txt && sudo systemctl restart leemisut
+```
+
+### 상태 확인 · 문제 해결
+
+```bash
+sudo systemctl status leemisut
+```
+지금 살아 있는지 확인합니다. `active (running)` 이면 정상입니다.
+
+```bash
+journalctl -u leemisut -f
+```
+로그를 실시간으로 봅니다. (`Ctrl+C` 로 빠져나옵니다) 시작할 때 아래 순서로 나오면 정상입니다.
+
+```text
+🗄️ DB 연결 완료: PostgreSQL aws-0-xxxx.pooler.supabase.com:6543/postgres · 풀러(prepared statement 끔)
+🔐 봇 관리자 1명 등록 (ADMIN_USER_IDS)
+🧩 Cog 로드 완료: cogs.admin / cogs.general / cogs.sign_language
+🔗 전역 슬래시 명령어 13개 동기화
+✨ 수어 연구학 조교 이미숫(이)가 성공적으로 디스코드에 접속했습니다!
+```
+
+| 증상 | 확인할 것 |
+|---|---|
+| `status=1/FAILURE` 로 계속 재시작 | VM의 `.env` 가 비었거나 값이 잘못됨. `.env` 는 Git에 올라가지 않으므로 서버에서 직접 채워야 합니다 |
+| `⚠️ 디스코드 접속이 끊겼습니다(N번째 시도)` | 디스코드 · 네트워크 일시 장애. 봇이 스스로 다시 붙으므로 기다리면 됩니다 |
+| `❌ 디스코드가 토큰을 거부했습니다` | `DISCORD_TOKEN` 오타 · 따옴표 · 재발급 여부 확인 |
+| 슬래시 명령어가 `10062` 로 실패 | 같은 토큰으로 **다른 PC에서도 봇이 켜져 있는지** 확인 (한 번에 한 곳만) |
+
+> ⚠️ **`.env` 는 저장소에 없습니다.** VM을 새로 만들었다면 `git clone` 뒤 `.env` 를 직접 만들어야 합니다. (`DISCORD_TOKEN` · `DATABASE_URL` · `KSL_API_KEY` · `ADMIN_USER_IDS`)  
+> ⚠️ 봇은 **한 번에 한 곳에서만** 켜 주세요. VM에서 돌리는 동안 집 PC에서도 켜면 하나의 상호작용을 두 봇이 함께 받아 슬래시 명령어가 실패합니다.
 
 ## ☁️ 클라우드 DB 연동 (Supabase / Neon)
 
@@ -241,7 +301,7 @@ python migrate_to_cloud.py --verify-only
 # DATABASE_URL=postgresql://postgres:비밀번호@db.xxxx.supabase.co:5432/postgres
 ```
 
-봇을 다시 켜면 `🗄️ DB 연결 완료: SQLite 파일 ...` 로그와 함께 `data/imisut.db` 로 동작합니다. 코드를 고칠 필요도, 패키지를 지울 필요도 없습니다.
+봇을 다시 켜면(`sudo systemctl restart leemisut`) `🗄️ DB 연결 완료: SQLite 파일 ...` 로그와 함께 `data/imisut.db` 로 동작합니다. 코드를 고칠 필요도, 패키지를 지울 필요도 없습니다.
 
 > 📌 롤백 기간에 로컬에 쌓인 기록을 나중에 클라우드로 올리려면 `migrate_to_cloud.py` 를 한 번 더 실행하면 됩니다. 이때 **새로 생긴 행만 올라가고, 같은 키를 가진 행(예: 이미 클라우드에 있는 유저의 포인트)은 건너뛰므로 덮어써지지 않습니다.**  
 > ⚠️ 봇은 **한 번에 한 곳에서만** 켜 주세요. 클라우드 DB를 쓰더라도 같은 토큰으로 두 PC에서 켜면 하나의 상호작용을 두 봇이 함께 받아 슬래시 명령어가 `10062` 오류로 실패합니다.
@@ -250,6 +310,7 @@ python migrate_to_cloud.py --verify-only
 - 유저의 포인트 · 출석 · 퀴즈 기록 · 단어장은 `DATABASE_URL` 을 설정했다면 **운영자 본인의 클라우드 PostgreSQL**에, 설정하지 않았다면 서버 컴퓨터의 `data/` 폴더 SQLite DB에 저장됩니다. 어느 쪽이든 제3자에게 전송되지 않습니다.
 - `data/` 폴더와 `*.db` · `*.db-wal` · `*.db-shm` 파일, `.env` 는 `.gitignore` 로 GitHub에 올라가지 않도록 막혀 있습니다.
 - `DATABASE_URL` 에는 DB 전체 권한 비밀번호가 들어 있으므로 `.env` 안에만 두고, 화면 공유 · 이슈 · 로그에 노출되지 않도록 주의해 주세요.
+- 운영 서버(VM)의 `.env` 는 그 서버에만 있습니다. 서버를 폐기할 때는 `.env` 부터 지우고, 토큰이 노출됐다고 판단되면 디스코드 개발자 포털에서 **토큰을 재발급**해 주세요.
 - 개인정보 처리 방침은 위 [이미숫 가이드라인(Notion)](#-이미숫-가이드라인notion)의 개인정보 보호 정책을 참고해 주세요.
 
 ## 📜 라이선스 및 저작권 (License & Copyright)

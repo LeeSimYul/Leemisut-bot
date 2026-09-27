@@ -1,13 +1,11 @@
 """
 main.py
-조교 이미숫 - 엔트리 포인트 (Cog 자동 로드 + DB 연결 + 헬스 체크 서버)
+조교 이미숫 - 엔트리 포인트 (Cog 자동 로드 + DB 연결)
 
-Render 같은 웹 서비스 호스팅은 '열려 있는 HTTP 포트'가 있어야 배포를 살아 있다고 판단합니다.
-그래서 봇과 함께 아주 가벼운 웹 서버를 띄워 / 와 /health 요청에 200 OK 로 답합니다.
-(웹 서버는 discord.py 가 이미 쓰는 aiohttp 로 만들어, 추가 패키지가 필요하지 않습니다)
-
-디스코드가 잠깐 5xx 를 돌려주거나 네트워크가 흔들려도 프로세스를 죽이지 않고,
-점점 긴 간격으로 다시 접속을 시도합니다. (run_bot_forever)
+오라클 클라우드 VM 에서 systemd 서비스로 상시 가동합니다. 디스코드가 잠깐 5xx 를
+돌려주거나 네트워크가 흔들려도 프로세스를 죽이지 않고, 점점 긴 간격으로 다시
+접속을 시도합니다. (run_bot_forever) 서비스 재시작보다 조용하고, 끊긴 동안 쌓이는
+재접속 요청도 줄어듭니다.
 """
 from __future__ import annotations
 
@@ -18,7 +16,7 @@ import time
 from pathlib import Path
 
 import discord
-from aiohttp import ClientError, web
+from aiohttp import ClientError
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -31,9 +29,6 @@ load_dotenv(BASE_DIR / ".env")
 TOKEN = os.getenv("DISCORD_TOKEN")
 DEV_GUILD_ID = os.getenv("DEV_GUILD_ID")  # (선택) 테스트 서버 ID - 설정하면 해당 서버에 즉시 동기화
 DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "data" / "imisut.db"))
-# 호스팅이 지정해 주는 포트. Render 는 PORT 를 넣어 주고, 로컬에서는 10000 을 씁니다.
-HEALTH_PORT = int(os.getenv("PORT", "10000"))
-HEALTH_HOST = "0.0.0.0"  # 호스팅 바깥에서 들어오는 헬스 체크를 받으려면 모든 주소에서 들어야 합니다
 
 # ── 접속 재시도 간격 ───────────────────────────────────────────
 RETRY_BASE_DELAY = 30.0        # 첫 재시도까지 기다리는 시간(초). 실패할수록 2배씩 늘립니다
@@ -141,40 +136,6 @@ class ImisutBot(commands.Bot):
             await self.db.close()
 
 
-async def health_check(request: web.Request) -> web.Response:
-    """호스팅의 헬스 체크 요청에 답합니다. (GET / · GET /health)"""
-    return web.Response(text="Leemisut Bot is running!", status=200)
-
-
-async def start_health_server() -> web.AppRunner | None:
-    """
-    헬스 체크용 HTTP 서버를 띄웁니다. (봇을 막지 않고 백그라운드로 돕니다)
-
-    포트를 열지 못해도 봇 본체는 계속 켭니다. 디스코드에서 쓰는 데에는 지장이 없고,
-    호스팅이 포트를 못 찾는 문제는 아래 경고 로그로 확인할 수 있습니다.
-    """
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    app.router.add_get("/health", health_check)
-
-    runner = web.AppRunner(app, access_log=None)  # 헬스 체크 요청까지 로그로 남기면 시끄럽습니다
-    await runner.setup()
-    try:
-        await web.TCPSite(runner, HEALTH_HOST, HEALTH_PORT).start()
-    except OSError:
-        await runner.cleanup()
-        log.warning(
-            "⚠️ 헬스 체크 서버가 %s:%d 포트를 열지 못했습니다. (이미 쓰는 중일 수 있어요) "
-            "봇은 그대로 실행합니다.",
-            HEALTH_HOST,
-            HEALTH_PORT,
-        )
-        return None
-
-    log.info("🌐 헬스 체크 서버 시작: %s:%d (GET / · /health)", HEALTH_HOST, HEALTH_PORT)
-    return runner
-
-
 def _is_retryable_http(exc: discord.HTTPException) -> bool:
     """잠시 뒤 다시 시도해 볼 만한 HTTP 오류인가? (디스코드 5xx · Cloudflare 429)"""
     return exc.status >= 500 or exc.status == 429
@@ -208,9 +169,10 @@ async def run_bot_forever() -> None:
     """
     봇을 접속시키고, 일시적인 오류로 끊기면 점점 긴 간격으로 다시 시도합니다.
 
-    호스팅의 자동 재시작에 맡기지 않는 이유가 있습니다. 재시작은 매번 새 프로세스로
-    디스코드를 다시 두드려 요청 제한·차단을 오히려 길게 만들고, 그 사이 헬스 체크 포트도
-    닫혀 배포가 실패로 처리됩니다. 한 프로세스 안에서 포트를 열어 둔 채 기다리는 편이 낫습니다.
+    systemd 의 자동 재시작(Restart=)에만 맡기지 않는 이유가 있습니다. 재시작은 매번 새
+    프로세스로 디스코드에 다시 로그인해 요청 제한·차단을 오히려 길게 만들고, 간격도 고정입니다.
+    한 프로세스 안에서 점점 길게 기다리는 편이 조용하고, DB 커넥션 풀도 그대로 살아 있습니다.
+    (systemd 재시작은 프로세스 자체가 죽는 사고에 대비한 바깥쪽 안전망으로 남겨 둡니다)
 
     토큰이 틀렸거나 특권 인텐트가 꺼져 있는 것처럼 '사람이 고쳐야 하는' 문제는
     몇 번 다시 시도해도 똑같으므로, 무엇을 고쳐야 하는지 알리고 바로 멈춥니다.
@@ -260,31 +222,15 @@ async def run_bot_forever() -> None:
             return
 
 
-async def run_all() -> None:
-    """
-    헬스 체크 서버를 먼저 열고 나서 봇을 접속시킵니다.
-
-    순서가 중요합니다. 디스코드 로그인이나 DB 연결이 늦어져도 포트는 이미 열려 있어서,
-    호스팅이 'No open ports detected' 로 배포를 실패 처리하지 않습니다. 재시도를 기다리는
-    동안에도 포트는 계속 열려 있습니다.
-    """
-    runner = await start_health_server()
-    try:
-        await run_bot_forever()
-    finally:
-        if runner is not None:
-            await runner.cleanup()
-
-
 def main() -> None:
     if not TOKEN:
         raise SystemExit("❌ .env 파일에 DISCORD_TOKEN이 설정되어 있지 않습니다.")
 
     discord.utils.setup_logging(level=logging.INFO)  # discord + 우리 봇 로그를 함께 출력
     try:
-        asyncio.run(run_all())
+        asyncio.run(run_bot_forever())
     except KeyboardInterrupt:
-        log.info("👋 종료 신호를 받아 봇과 헬스 체크 서버를 정리했습니다.")
+        log.info("👋 종료 신호를 받아 봇을 정리했습니다.")
 
 
 if __name__ == "__main__":

@@ -83,6 +83,9 @@ DATABASE_URL_ENV = "DATABASE_URL"
 POOL_MIN_SIZE = 1
 POOL_MAX_SIZE = 5
 POOL_COMMAND_TIMEOUT = 30.0  # 초 - 한 질의가 이보다 오래 걸리면 끊습니다
+# 초 - 이만큼 쉰 커넥션은 풀이 스스로 버리고 다음에 새로 맺습니다.
+# 풀러(pgbouncer)나 중간 방화벽이 먼저 끊어 버리기 전에 우리가 정리하려는 값입니다.
+POOL_IDLE_LIFETIME = 180.0
 CONNECT_RETRIES = 3          # Neon 등은 절전에서 깨어나며 첫 연결이 실패할 수 있습니다
 CONNECT_RETRY_DELAY = 2.0    # 초
 
@@ -458,6 +461,8 @@ class PostgresBackend(Backend):
         # 트랜잭션 동안 한 커넥션을 붙잡아 둡니다. (풀에서 매번 다른 커넥션을 받으면
         # BEGIN 과 COMMIT 이 서로 다른 커넥션으로 흩어져 원자성이 깨집니다)
         self._tx_conn: ContextVar[Any] = ContextVar("pg_tx_conn", default=None)
+        # connect() 에서 채웁니다. 빈 튜플은 '아무 예외도 잡지 않음' 을 뜻합니다.
+        self._lost_errors: tuple[type[BaseException], ...] = ()
 
     @property
     def pool(self) -> Any:
@@ -466,8 +471,6 @@ class PostgresBackend(Backend):
         return self._pool
 
     async def connect(self) -> None:
-        import asyncio
-
         try:
             import asyncpg
         except ImportError as exc:  # 설치 안내
@@ -478,6 +481,13 @@ class PostgresBackend(Backend):
 
         # 트랜잭션 풀러(Supabase 6543 등) 뒤에서는 prepared statement 를 재사용할 수 없습니다.
         statement_cache_size = 0 if self.uses_pooler else 100
+        # 커넥션이 끊겼을 때 알아볼 예외들. (asyncpg 를 불러온 뒤에야 알 수 있습니다)
+        self._lost_errors = (
+            asyncpg.exceptions.PostgresConnectionError,  # 커넥션이 사라짐 · 거부됨
+            asyncpg.exceptions.AdminShutdownError,       # 서버·풀러가 커넥션을 끊음
+            asyncpg.exceptions.InterfaceError,           # 이미 닫힌 커넥션을 쓰려 함
+            ConnectionError,                             # 소켓이 끊김 (OSError 계열)
+        )
 
         last_error: Exception | None = None
         for attempt in range(1, CONNECT_RETRIES + 1):
@@ -487,6 +497,7 @@ class PostgresBackend(Backend):
                     min_size=self.min_size,
                     max_size=self.max_size,
                     command_timeout=POOL_COMMAND_TIMEOUT,
+                    max_inactive_connection_lifetime=POOL_IDLE_LIFETIME,
                     statement_cache_size=statement_cache_size,
                     server_settings={"application_name": "leemisut-bot"},
                 )
@@ -521,13 +532,41 @@ class PostgresBackend(Backend):
         async with self.pool.acquire() as conn:
             yield conn
 
-    async def fetch_all(self, sql: str, params: Sequence[Any] = ()) -> list[Row]:
+    async def _read(self, action: Any, label: str) -> Any:
+        """
+        조회를 실행하되, 끊긴 커넥션을 잡았다면 새 커넥션으로 딱 한 번만 다시 시도합니다.
+
+        봇이 새벽처럼 한참 조용하다가 첫 명령을 받을 때, 풀러나 중간 방화벽이 이미 조용히
+        끊어 둔 커넥션을 잡는 일이 있습니다. 그대로 두면 그 명령 하나가 통째로 실패합니다.
+
+        ⚠️ 다시 시도하는 것은 '조회'뿐입니다. 쓰기는 서버가 이미 실행한 뒤에 응답만 못 받았을
+           수도 있어서, 다시 보내면 포인트가 두 번 지급되거나 단어장 토글이 되돌아갑니다.
+           어차피 명령어들은 쓰기 전에 조회를 먼저 하므로, 그때 커넥션이 새것으로 바뀝니다.
+        ⚠️ 트랜잭션 안에서도 다시 시도하지 않습니다. 붙잡아 둔 커넥션이 죽었다면 그 트랜잭션은
+           이미 깨진 것이라, 일부만 되살리는 것보다 통째로 되돌리는 편이 안전합니다.
+        """
+        try:
+            async with self._connection() as conn:
+                return await action(conn)
+        except self._lost_errors as exc:
+            if self._tx_conn.get() is not None:
+                raise
+            log.warning(
+                "DB 커넥션이 끊겨 있어 새로 연결해 다시 조회합니다 (%s): %s",
+                label,
+                exc,
+            )
         async with self._connection() as conn:
-            return list(await conn.fetch(self.sql(sql), *params))
+            return await action(conn)
+
+    async def fetch_all(self, sql: str, params: Sequence[Any] = ()) -> list[Row]:
+        query = self.sql(sql)
+        rows = await self._read(lambda conn: conn.fetch(query, *params), "목록 조회")
+        return list(rows)
 
     async def fetch_one(self, sql: str, params: Sequence[Any] = ()) -> Row | None:
-        async with self._connection() as conn:
-            return await conn.fetchrow(self.sql(sql), *params)
+        query = self.sql(sql)
+        return await self._read(lambda conn: conn.fetchrow(query, *params), "단건 조회")
 
     async def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         async with self._connection() as conn:
