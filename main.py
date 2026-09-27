@@ -5,16 +5,20 @@ main.py
 Render 같은 웹 서비스 호스팅은 '열려 있는 HTTP 포트'가 있어야 배포를 살아 있다고 판단합니다.
 그래서 봇과 함께 아주 가벼운 웹 서버를 띄워 / 와 /health 요청에 200 OK 로 답합니다.
 (웹 서버는 discord.py 가 이미 쓰는 aiohttp 로 만들어, 추가 패키지가 필요하지 않습니다)
+
+디스코드가 잠깐 5xx 를 돌려주거나 네트워크가 흔들려도 프로세스를 죽이지 않고,
+점점 긴 간격으로 다시 접속을 시도합니다. (run_bot_forever)
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 
 import discord
-from aiohttp import web
+from aiohttp import ClientError, web
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -30,6 +34,21 @@ DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "data" / "imisut.db"))
 # 호스팅이 지정해 주는 포트. Render 는 PORT 를 넣어 주고, 로컬에서는 10000 을 씁니다.
 HEALTH_PORT = int(os.getenv("PORT", "10000"))
 HEALTH_HOST = "0.0.0.0"  # 호스팅 바깥에서 들어오는 헬스 체크를 받으려면 모든 주소에서 들어야 합니다
+
+# ── 접속 재시도 간격 ───────────────────────────────────────────
+RETRY_BASE_DELAY = 30.0        # 첫 재시도까지 기다리는 시간(초). 실패할수록 2배씩 늘립니다
+RETRY_MAX_DELAY = 600.0        # 아무리 늘어나도 이 간격(10분)을 넘기지 않습니다
+RETRY_COOLDOWN_DELAY = 300.0   # Cloudflare 차단(429)은 금방 풀리지 않아 최소 5분은 쉽니다
+RETRY_STABLE_UPTIME = 300.0    # 이만큼(5분) 붙어 있었다면 정상 가동으로 보고 간격을 초기화합니다
+# 잠시 뒤 다시 시도해 볼 만한 오류들. 토큰·인텐트처럼 사람이 고쳐야 하는 오류는 넣지 않습니다.
+RETRYABLE_ERRORS: tuple[type[BaseException], ...] = (
+    discord.HTTPException,     # 5xx · 429 만 재시도합니다 (_is_retryable_http 로 가립니다)
+    discord.GatewayNotFound,  # 게이트웨이 주소를 못 받아온 경우
+    discord.ConnectionClosed, # 게이트웨이가 예상 밖 코드로 끊은 경우
+    ClientError,              # 연결 실패 · DNS 오류 등 aiohttp 쪽 문제
+    OSError,                  # 네트워크가 잠깐 끊긴 경우
+    TimeoutError,             # 응답이 오지 않는 경우 (asyncio.TimeoutError 와 같습니다)
+)
 
 log = logging.getLogger("imisut")
 
@@ -156,18 +175,102 @@ async def start_health_server() -> web.AppRunner | None:
     return runner
 
 
+def _is_retryable_http(exc: discord.HTTPException) -> bool:
+    """잠시 뒤 다시 시도해 볼 만한 HTTP 오류인가? (디스코드 5xx · Cloudflare 429)"""
+    return exc.status >= 500 or exc.status == 429
+
+
+def _retry_delay(exc: BaseException, delay: float) -> float:
+    """이번에 기다릴 시간. 요청 제한에 걸렸다면 더 오래 쉽니다."""
+    if isinstance(exc, discord.HTTPException) and exc.status == 429:
+        return max(delay, RETRY_COOLDOWN_DELAY)
+    return delay
+
+
+def _one_line(exc: BaseException, limit: int = 200) -> str:
+    """
+    오류 내용을 로그 한 줄로 줄입니다.
+
+    디스코드가 JSON 대신 Cloudflare 오류 페이지를 돌려주면 그 HTML 전체가 오류 메시지에
+    실려 옵니다. 그대로 찍으면 로그가 HTML로 뒤덮여 정작 필요한 줄이 묻히므로 잘라 냅니다.
+    """
+    try:
+        text = " ".join(str(exc).split())
+    except Exception:
+        # 오류 메시지를 만드는 것조차 실패할 수 있습니다. 로그 때문에 재시도가 멈추면 안 됩니다.
+        text = ""
+    if not text:
+        return type(exc).__name__
+    return text if len(text) <= limit else f"{text[:limit]} …(이하 생략)"
+
+
+async def run_bot_forever() -> None:
+    """
+    봇을 접속시키고, 일시적인 오류로 끊기면 점점 긴 간격으로 다시 시도합니다.
+
+    호스팅의 자동 재시작에 맡기지 않는 이유가 있습니다. 재시작은 매번 새 프로세스로
+    디스코드를 다시 두드려 요청 제한·차단을 오히려 길게 만들고, 그 사이 헬스 체크 포트도
+    닫혀 배포가 실패로 처리됩니다. 한 프로세스 안에서 포트를 열어 둔 채 기다리는 편이 낫습니다.
+
+    토큰이 틀렸거나 특권 인텐트가 꺼져 있는 것처럼 '사람이 고쳐야 하는' 문제는
+    몇 번 다시 시도해도 똑같으므로, 무엇을 고쳐야 하는지 알리고 바로 멈춥니다.
+    """
+    delay = RETRY_BASE_DELAY
+    attempt = 0
+
+    while True:
+        attempt += 1
+        bot = ImisutBot()  # 한 번 닫은 봇은 다시 쓸 수 없어 시도마다 새로 만듭니다
+        started_at = time.monotonic()
+        try:
+            async with bot:  # 나갈 때 bot.close() 가 불려 DB 연결까지 정리됩니다
+                await bot.start(TOKEN, reconnect=True)
+        except discord.LoginFailure:
+            log.error(
+                "❌ 디스코드가 토큰을 거부했습니다. DISCORD_TOKEN 값을 확인해 주세요. "
+                "(따옴표·공백이 섞였거나 토큰을 재발급했을 수 있습니다) 재시도하지 않고 종료합니다."
+            )
+            raise
+        except discord.PrivilegedIntentsRequired:
+            log.error(
+                "❌ 특권 인텐트가 꺼져 있습니다. 개발자 포털 → Bot → Privileged Gateway Intents 에서 "
+                "MESSAGE CONTENT 와 SERVER MEMBERS 를 켜 주세요. 재시도하지 않고 종료합니다."
+            )
+            raise
+        except RETRYABLE_ERRORS as exc:
+            if isinstance(exc, discord.HTTPException) and not _is_retryable_http(exc):
+                raise  # 401 · 403 처럼 다시 시도해도 결과가 같은 오류는 그대로 알립니다
+
+            if time.monotonic() - started_at >= RETRY_STABLE_UPTIME:
+                # 한참 정상 가동한 뒤 끊긴 경우라면 처음 간격부터 다시 셉니다.
+                delay, attempt = RETRY_BASE_DELAY, 1
+
+            wait = _retry_delay(exc, delay)
+            log.warning(
+                "⚠️ 디스코드 접속이 끊겼습니다(%d번째 시도). %.0f초 뒤 다시 붙어 봅니다. · %s: %s",
+                attempt,
+                wait,
+                type(exc).__name__,
+                _one_line(exc),
+            )
+            await asyncio.sleep(wait)
+            delay = min(delay * 2, RETRY_MAX_DELAY)
+        else:
+            log.info("🛑 봇이 정상적으로 종료되었습니다.")
+            return
+
+
 async def run_all() -> None:
     """
     헬스 체크 서버를 먼저 열고 나서 봇을 접속시킵니다.
 
     순서가 중요합니다. 디스코드 로그인이나 DB 연결이 늦어져도 포트는 이미 열려 있어서,
-    호스팅이 'No open ports detected' 로 배포를 실패 처리하지 않습니다.
+    호스팅이 'No open ports detected' 로 배포를 실패 처리하지 않습니다. 재시도를 기다리는
+    동안에도 포트는 계속 열려 있습니다.
     """
     runner = await start_health_server()
-    bot = ImisutBot()
     try:
-        async with bot:  # 나갈 때 bot.close() 가 불려 DB 연결까지 정리됩니다
-            await bot.start(TOKEN, reconnect=True)
+        await run_bot_forever()
     finally:
         if runner is not None:
             await runner.cleanup()
