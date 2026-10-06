@@ -10,7 +10,7 @@ migrate_to_cloud.py
 
 ■ 무엇을 옮기나요?
     sign_words(수어 단어) · users(포인트 · 출석) · quiz_logs(퀴즈 기록) · user_bookmarks(단어장)
-    네 테이블을 전부 옮깁니다. word_id · log_id 같은 ID도 그대로 옮겨서,
+    · user_quiz_notes(오답노트) 다섯 테이블을 전부 옮깁니다. (원본에 없는 테이블 · 컬럼은 건너뜁니다) word_id · log_id 같은 ID도 그대로 옮겨서,
     퀴즈 기록과 단어장이 가리키는 단어가 어긋나지 않게 합니다.
 
 ■ 안전장치
@@ -69,12 +69,17 @@ TABLES: tuple[TableSpec, ...] = (
     ),
     TableSpec(
         "quiz_logs",
-        ("log_id", "user_id", "word_id", "is_correct", "solved_at"),
+        ("log_id", "user_id", "word_id", "is_correct", "solved_at", "quiz_type"),
         id_column="log_id",
     ),
     TableSpec(
         "user_bookmarks",
         ("user_id", "word_id", "created_at"),
+    ),
+    TableSpec(
+        "user_quiz_notes",
+        ("id", "user_id", "word_id", "wrong_count", "is_mastered", "last_wrong_at", "mastered_at"),
+        id_column="id",
     ),
 )
 

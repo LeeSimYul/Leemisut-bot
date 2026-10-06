@@ -20,8 +20,9 @@ from discord import app_commands
 from discord.ext import commands
 
 from database import Database, Row
-# 일일 보상 상한선은 퀴즈 기능(cogs/sign_language.py)에서 한 번만 정의해 함께 씁니다.
-from cogs.sign_language import MAX_DAILY_QUIZ_REWARDS
+# 보상 밸런스는 utils/rewards.py 한 곳에서 관리합니다.
+# (cogs 끼리 import 하면 확장 모듈이 두 번 만들어지므로 공용 값은 utils 에 둡니다)
+from utils.rewards import MAX_DAILY_QUIZ_REWARDS
 
 log = logging.getLogger(__name__)
 
@@ -151,7 +152,8 @@ HELP_TEXT = (
     "`/오늘의수어` — 나에게 맞춘 오늘의 단어 & 출석 체크\n"
     "`/수어검색` — 단어 · 분야 조건으로 수어 사전 검색\n"
     "\n**🧩 퀴즈 & 복습**\n"
-    "`/수어퀴즈` — 수어 퀴즈 풀기 (틀린 단어는 복습 문제로 다시 나와요)\n"
+    "`/수어퀴즈` — 수어 퀴즈 풀기 (틀린 단어는 오답노트에 자동 저장)\n"
+    "`/오답노트` · `/복습퀴즈` — 틀린 단어 모아 보기 · 다시 풀어 해결하기\n"
     "`/단어장저장` · `/수어단어장` — 나만의 단어장에 담고 모아 보기\n"
     "\n**📜 표현력 향상**\n"
     "`/명언` 또는 `/격언` — 한 문장을 수어로 어떻게 옮길지 생각하기\n"

@@ -1,6 +1,6 @@
 """
 cogs/sign_language.py
-조교 이미숫 - '오늘의 수어' · '수어 퀴즈' · '수어 검색' · '나만의 단어장'
+조교 이미숫 - '오늘의 수어' · '수어 퀴즈' · '오답노트 · 복습 퀴즈' · '수어 검색' · '나만의 단어장'
 
 관리자용 명령어(/수어동기화, /수어전체동기화, /수어삭제, /수어목록)는 cogs/admin.py 에 있습니다.
 
@@ -15,11 +15,14 @@ cogs/sign_language.py
    (같은 토큰으로 여러 PC·프로세스를 켜 두면 하나의 상호작용을 여러 봇이 함께 받습니다)
 ■ /수어검색 결과가 여러 개면 5개씩 페이지 버튼(◀ 이전 · 1 / N · ▶ 다음)으로 넘겨 봅니다.
    (공용 컴포넌트: utils/paginator.py)
-■ /수어퀴즈 는 30% 확률로 '틀린 뒤 아직 못 맞힌 단어'를 정답으로 내는 복습 문제를 냅니다.
+■ 오답노트: /수어퀴즈 · /복습퀴즈 에서 틀린 단어(시간 초과 포함)는 user_quiz_notes 에 자동으로
+   쌓입니다. /오답노트 로 많이 틀린 순서대로 보고, /복습퀴즈 로 맞히면 해결(마스터)됩니다.
+   /수어퀴즈 정답은 오답노트를 바꾸지 않습니다. (해결은 /복습퀴즈 로만)
+■ /수어퀴즈 는 30% 확률로 오답노트의 미해결 단어를 정답으로 내는 복습 문제를 냅니다.
    풀이 결과(정답 · 오답 · 시간 초과)는 모두 quiz_logs 에 기록됩니다.
 ■ 퀴즈 카드·버튼·채점 결과는 명령어를 부른 본인에게만 보입니다. (ephemeral · 채널 도배 방지)
-■ 퀴즈 보상은 하루 MAX_DAILY_QUIZ_REWARDS 회까지만 지급합니다.
-   상한을 채운 뒤에도 문제 풀이와 학습 기록(quiz_logs)은 제한 없이 계속됩니다.
+■ 보상 수치와 하루 상한선은 utils/rewards.py 한 곳에서 관리합니다.
+   /수어퀴즈 · /복습퀴즈 는 상한을 따로 세며, 상한을 채운 뒤에도 풀이와 학습 기록은 계속됩니다.
 ■ /단어장저장 · /수어단어장 으로 나만의 단어장을 관리합니다. (본인에게만 보이는 메시지)
 """
 from __future__ import annotations
@@ -28,6 +31,7 @@ import contextlib
 import logging
 import random
 import re
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
@@ -35,29 +39,42 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from database import Database, Row
+from database import QUIZ_TYPE_REVIEW, Database, Row
 from utils.paginator import SignPaginatorView, page_count
+from utils.rewards import (
+    DAILY_EXP,
+    DAILY_POINTS,
+    MAX_DAILY_QUIZ_REWARDS,
+    MAX_DAILY_REVIEW_REWARDS,
+    REVIEW_REWARD_EXP,
+    REVIEW_REWARD_POINTS,
+    REWARD_EXP,
+    REWARD_POINTS,
+)
 
 log = logging.getLogger(__name__)
 
 # ── 설정값 ──────────────────────────────────────────────────────
 KST = timezone(timedelta(hours=9))  # zoneinfo는 Windows에서 tzdata가 필요해서 고정 오프셋 사용
 QUIZ_CHOICES = 4
-QUIZ_TIMEOUT = 45  # 초
-REWARD_POINTS = 10
-REWARD_EXP = 10
-# 포인트 어뷰징 방지: 하루에 퀴즈 보상을 받을 수 있는 최대 횟수 (10회 = 최대 100pt / 100exp)
-# 상한을 채워도 퀴즈 풀이·오답 복습 기록은 제한 없이 계속 쌓입니다.
-MAX_DAILY_QUIZ_REWARDS = 10
-DAILY_POINTS = 5   # /오늘의수어 출석 보상
-DAILY_EXP = 5
+QUIZ_TIMEOUT = 45  # 초 - /수어퀴즈 · /복습퀴즈 공통 제한 시간
+# 보상 수치(REWARD_* · DAILY_* · REVIEW_REWARD_*)와 하루 상한선은 utils/rewards.py 에 있습니다.
 SEARCH_PAGE_SIZE = 5    # /수어검색 결과 목록 한 페이지에 보여 줄 건수
 BOOKMARK_PAGE_SIZE = 5  # /수어단어장 한 페이지에 보여 줄 건수
+NOTES_PAGE_SIZE = 5     # /오답노트 한 페이지에 보여 줄 건수
+NOTES_PAGINATOR_TIMEOUT = 180.0  # 초 - /오답노트 페이지 버튼이 잠기기까지 (마지막 조작 기준)
 
-# 오답 복습: /수어퀴즈 에서 이 확률로 '틀린 뒤 아직 못 맞힌 단어'를 정답으로 냅니다.
+# 오답 복습: /수어퀴즈 에서 이 확률로 오답노트의 미해결 단어를 정답으로 냅니다.
 REVIEW_PROBABILITY = 0.3
 REVIEW_POOL_SIZE = 10   # 복습 후보로 볼 오답 수 (많이 틀린 → 최근에 틀린 순)
-REVIEW_NOTICE = "🔁 틀린 단어는 나중에 복습 문제로 다시 나올 수 있어요."
+# /복습퀴즈 출제 후보 수. 이 안에서 많이 틀린 단어일수록 자주 나오도록 가중치를 줍니다.
+REVIEW_QUIZ_POOL_SIZE = 30
+REVIEW_NOTICE = "📒 틀린 단어는 오답노트에 담겨요. `/복습퀴즈` 로 다시 도전해 보세요!"
+NOTES_EMPTY_MESSAGE = "현재 등록된 오답이 없습니다! 모든 수어 단어를 완벽히 마스터하셨네요 🎉"
+SAVE_FAILED_NOTICE = (
+    "⚠️ 기록을 저장하지 못해 이번에는 보상을 드리지 못했어요.\n"
+    "잠시 후 다시 도전해 주세요!"
+)
 
 # /단어장저장 자동완성 후보를 고르면 들어오는 값 ('#단어ID') - 동음이의어를 정확히 구분합니다.
 BOOKMARK_ID_PATTERN = re.compile(r"#(\d{1,19})")
@@ -84,6 +101,7 @@ COLOR_CORRECT = discord.Color.green()
 COLOR_WRONG = discord.Color.red()
 COLOR_TIMEOUT = discord.Color.light_grey()
 COLOR_BOOKMARK = discord.Color.from_rgb(122, 198, 160)
+COLOR_NOTES = discord.Color.from_rgb(239, 154, 154)  # 오답노트 · 복습 퀴즈
 
 
 def today_kst() -> date:
@@ -279,6 +297,93 @@ def build_bookmark_page_embed(
     return embed
 
 
+def format_kst_date(iso_text: str) -> str:
+    """DB 의 UTC 시각 문자열을 KST 날짜(2026.10.06)로 바꿉니다."""
+    try:
+        return datetime.fromisoformat(iso_text).astimezone(KST).strftime("%Y.%m.%d")
+    except (TypeError, ValueError):
+        return (iso_text or "")[:10]
+
+
+def build_notes_page_embed(
+    words: list[Row], *, owner_name: str, total: int, mastered: int, offset: int
+) -> discord.Embed:
+    """/오답노트 한 페이지. 많이 틀린 순서대로 오답 횟수 · 마지막 오답일 · 영상 · 사전 링크를 보여 줍니다."""
+    lines = []
+    for number, w in enumerate(words, start=offset + 1):
+        line = (
+            f"`{number}.` **{w['word_name']}** [{w['category']}] — "
+            f"❌ **{w['wrong_count']}**회 · 🗓️ {format_kst_date(w['last_wrong_at'])}"
+        )
+        links = link_field_value(w, include_detail=True)
+        if links:
+            line += f"\n└ {links}"
+        lines.append(line)
+
+    embed = discord.Embed(
+        title=f"📒 {owner_name} 님의 오답노트 (미해결 {total}개)",
+        description="\n".join(lines) or "이 페이지의 단어가 방금 삭제되었어요 🥲",
+        color=COLOR_NOTES,
+    )
+    embed.set_footer(
+        text=f"많이 틀린 순 · 복습으로 해결한 단어 {mastered}개 · /복습퀴즈 로 하나씩 해결해 봐요 🤟"
+    )
+    return embed
+
+
+def build_quiz_embed(
+    answer: Row, *, title: str, intro: str, footer: str
+) -> tuple[discord.Embed, str | None]:
+    """
+    퀴즈 문제 카드를 만듭니다. (/수어퀴즈 · /복습퀴즈 공용)
+    정답이 드러날 만한 정보(단어명 · 분류 · 사전 주소)는 넣지 않습니다.
+    반환: (임베드, 메시지 본문에 넣을 내용)
+    """
+    embed = discord.Embed(
+        title=title,
+        description=(
+            f"{intro}이 수어 동작은 어떤 뜻일까요?\n"
+            f"**{QUIZ_TIMEOUT}초** 안에 아래 버튼에서 골라 주세요!"
+        ),
+        color=COLOR_QUIZ,
+    )
+    content = set_media(embed, _row_get(answer, "image_url"), answer["video_url"])
+
+    # 영상 링크는 마스크 링크로만 (주소에 단어가 드러나지 않습니다)
+    video_link = masked("🎬 영상으로 문제 보기", answer["video_url"])
+    if video_link:
+        embed.add_field(name="문제 영상", value=video_link, inline=False)
+    embed.set_footer(text=footer)
+    return embed, content
+
+
+@dataclass
+class QuizOutcome:
+    """한 문제의 기록 · 보상 결과. (채점 화면 문구를 고르는 데 씁니다)"""
+
+    granted: bool = False              # 보상을 받았는지
+    used_today: int = 0                # 오늘 사용한 보상 횟수 (-1 = DB 오류로 기록 실패)
+    user: Row | None = None  # 보상 뒤 최신 유저 정보
+    mastered: bool = False             # /복습퀴즈: 이번 정답으로 오답노트에서 해결했는지
+    wrong_count: int = 0               # 오답일 때 이 단어의 누적 오답 횟수
+
+    @property
+    def failed(self) -> bool:
+        return self.used_today < 0
+
+
+def notes_notice(outcome: QuizOutcome) -> str:
+    """오답 · 시간 초과 화면 맨 아래 안내. 오답노트에 담겼으면 누적 횟수를 함께 보여 줍니다."""
+    if outcome.failed:
+        return "⚠️ 기록을 저장하지 못해 오답노트에 담지 못했어요."
+    if outcome.wrong_count > 0:
+        return (
+            f"📒 오답노트에 담았어요 (이 단어 오답 **{outcome.wrong_count}**회) · "
+            "`/복습퀴즈` 로 다시 도전해 보세요!"
+        )
+    return REVIEW_NOTICE
+
+
 # ── 퀴즈 UI ─────────────────────────────────────────────────────
 class QuizChoiceButton(discord.ui.Button["SignQuizView"]):
     def __init__(self, word_id: int, label: str) -> None:
@@ -291,6 +396,10 @@ class QuizChoiceButton(discord.ui.Button["SignQuizView"]):
 
 
 class SignQuizView(discord.ui.View):
+    # 하위 클래스(ReviewQuizView)가 바꿔 쓰는 안내 문구
+    command_hint = "/수어퀴즈"
+    finish_footer = "한 문제 더 풀어 볼까요? /수어퀴즈 🤟"
+
     def __init__(
         self,
         db: Database,
@@ -332,7 +441,7 @@ class SignQuizView(discord.ui.View):
         # 버튼 클릭은 별개의 상호작용이라 defer 없이 바로 응답해도 됩니다.
         await interaction.response.send_message(
             f"이 문제는 **{self.owner.display_name}** 님의 퀴즈예요! 🙌\n"
-            "`/수어퀴즈` 로 직접 도전해 보세요!",
+            f"`{self.command_hint}` 로 직접 도전해 보세요!",
             ephemeral=True,
         )
         return False
@@ -349,47 +458,16 @@ class SignQuizView(discord.ui.View):
         self.stop()
         self._reveal(chosen)
 
-        name = self.answer["word_name"]
         is_correct = chosen.word_id == self.answer["word_id"]
-        # 기록과 보상을 한 번에 처리합니다. (상한선 확인은 DB 안에서 원자적으로 이뤄집니다)
-        granted, used_today, user = await self._record(is_correct)
+        # 기록 · 보상 · 오답노트를 한 번에 처리합니다. (판단은 DB 안에서 원자적으로 이뤄집니다)
+        outcome = await self._record(is_correct)
 
         if is_correct:
             self.embed.color = COLOR_CORRECT
-            self.embed.title = f"🎉 정답이에요! — {name} [{self.answer['category']}]"
-            praise = (
-                "🎓 **복습 성공!** 전에 틀렸던 단어를 이번엔 맞히셨어요."
-                if self.is_review else "눈썰미가 대단하시네요 👏"
-            )
-            if granted and user is not None:
-                reward_line = (
-                    f"✨ 포인트 **+{REWARD_POINTS}** · 경험치 **+{REWARD_EXP}** "
-                    f"(오늘 보상 {used_today}/{MAX_DAILY_QUIZ_REWARDS}회)\n"
-                    f"현재 포인트 {user['points']} · 경험치 {user['exp']}"
-                )
-            elif used_today < 0:
-                # DB 오류로 기록조차 남기지 못한 경우 (상한선과 무관) - 솔직하게 알려 줍니다.
-                reward_line = (
-                    "⚠️ 기록을 저장하지 못해 이번에는 보상을 드리지 못했어요.\n"
-                    "잠시 후 다시 도전해 주세요!"
-                )
-            else:
-                # 상한선 도달: 보상은 0이지만 학습 기록은 _record 에서 이미 남겼습니다.
-                reward_line = (
-                    f"🎯 오늘의 퀴즈 보상 상한선"
-                    f"({MAX_DAILY_QUIZ_REWARDS}/{MAX_DAILY_QUIZ_REWARDS}회)에 달성하여 "
-                    "보상 없이 학습 기록만 남습니다.\n"
-                    "내일 다시 도전하면 보상을 받을 수 있어요! 🌙"
-                )
-            self.embed.description = f"{praise}\n{reward_line}"
+            self.embed.title, self.embed.description = self._correct_message(outcome)
         else:
             self.embed.color = COLOR_WRONG
-            self.embed.title = f"😅 아쉬워요! — 정답은 {name} [{self.answer['category']}]"
-            self.embed.description = (
-                f"고르신 답은 **{chosen.label}** 였어요.\n"
-                "손 모양을 한 번 더 따라 해 보고 다시 도전해 봐요! 💪\n"
-                f"{REVIEW_NOTICE}"
-            )
+            self.embed.title, self.embed.description = self._wrong_message(chosen, outcome)
 
         self._finish_embed()
         # 비공개(ephemeral) 메시지를 '그 자리에서' 고치므로 결과도 본인에게만 보입니다.
@@ -406,13 +484,10 @@ class SignQuizView(discord.ui.View):
         self.answered = True
         self._reveal()
 
+        outcome = await self._record(False)  # 시간 초과도 오답으로 기록하고 오답노트에 담습니다
         self.embed.color = COLOR_TIMEOUT
-        self.embed.title = (
-            f"⏰ 시간 초과! — 정답은 {self.answer['word_name']} [{self.answer['category']}]"
-        )
-        self.embed.description = f"다음엔 꼭 맞혀 봐요! 🤟\n{REVIEW_NOTICE}"
+        self.embed.title, self.embed.description = self._timeout_message(outcome)
         self._finish_embed()
-        await self._record(False)  # 시간 초과도 오답으로 기록합니다
 
         if self.message is not None:
             try:
@@ -420,31 +495,74 @@ class SignQuizView(discord.ui.View):
             except discord.HTTPException:
                 pass  # 메시지가 삭제된 경우 등
 
-    async def _record(self, is_correct: bool) -> tuple[bool, int, Row | None]:
+    async def _record(self, is_correct: bool) -> QuizOutcome:
         """
-        풀이 결과를 quiz_logs 에 남기고, 정답이면 일일 상한선 안에서 보상까지 처리합니다.
-        (handle_answer · on_timeout 모두 answered 플래그 뒤에서 불러 한 문제에 한 번만 기록)
-
-        반환: (보상 지급 여부, 오늘 사용한 보상 횟수, 최신 유저 정보)
-              DB 오류로 기록하지 못하면 (False, -1, None) - 상한선 도달과 구분하기 위한 값입니다.
+        풀이 결과를 기록합니다. (handle_answer · on_timeout 모두 answered 플래그 뒤에서 불러
+        한 문제에 한 번만 기록)
+          - 정답          : quiz_logs 기록 + 일일 상한선 안에서 보상 (오답노트는 그대로)
+          - 오답·시간 초과 : quiz_logs 기록 + 오답노트에 담기 (누적 횟수 +1)
+        DB 오류로 기록하지 못하면 used_today=-1 로 돌려줍니다. (상한선 도달과 구분하기 위한 값)
         """
+        word_id = self.answer["word_id"]
         try:
             if is_correct:
-                return await self.db.record_quiz_reward(
+                granted, used, user = await self.db.record_quiz_reward(
                     self.owner.id,
-                    self.answer["word_id"],
+                    word_id,
                     today_kst(),
                     points=REWARD_POINTS,
                     exp=REWARD_EXP,
                     max_daily_rewards=MAX_DAILY_QUIZ_REWARDS,
                 )
-            await self.db.log_quiz_attempt(self.owner.id, self.answer["word_id"], False)
-            return False, 0, None
+                return QuizOutcome(granted=granted, used_today=used, user=user)
+            wrong_count = await self.db.record_quiz_wrong(self.owner.id, word_id)
+            return QuizOutcome(wrong_count=wrong_count)
         except Exception:
-            log.exception(
-                "퀴즈 기록 저장 실패 (user=%s, word=%s)", self.owner.id, self.answer["word_id"]
+            log.exception("퀴즈 기록 저장 실패 (user=%s, word=%s)", self.owner.id, word_id)
+            return QuizOutcome(used_today=-1)
+
+    # ── 채점 화면 문구 (ReviewQuizView 가 바꿔 씁니다) ──────────
+    def _answer_label(self) -> str:
+        return f"{self.answer['word_name']} [{self.answer['category']}]"
+
+    def _correct_message(self, outcome: QuizOutcome) -> tuple[str, str]:
+        praise = (
+            "🎓 전에 틀렸던 단어를 이번엔 맞히셨어요! "
+            "`/복습퀴즈` 에서도 맞히면 오답노트에서 해결돼요."
+            if self.is_review else "눈썰미가 대단하시네요 👏"
+        )
+        if outcome.granted and outcome.user is not None:
+            reward_line = (
+                f"✨ 포인트 **+{REWARD_POINTS}** · 경험치 **+{REWARD_EXP}** "
+                f"(오늘 보상 {outcome.used_today}/{MAX_DAILY_QUIZ_REWARDS}회)\n"
+                f"현재 포인트 {outcome.user['points']} · 경험치 {outcome.user['exp']}"
             )
-            return False, -1, None
+        elif outcome.failed:
+            # DB 오류로 기록조차 남기지 못한 경우 (상한선과 무관) - 솔직하게 알려 줍니다.
+            reward_line = SAVE_FAILED_NOTICE
+        else:
+            # 상한선 도달: 보상은 0이지만 학습 기록은 _record 에서 이미 남겼습니다.
+            reward_line = (
+                f"🎯 오늘의 퀴즈 보상 상한선"
+                f"({MAX_DAILY_QUIZ_REWARDS}/{MAX_DAILY_QUIZ_REWARDS}회)에 달성하여 "
+                "보상 없이 학습 기록만 남습니다.\n"
+                "내일 다시 도전하면 보상을 받을 수 있어요! 🌙"
+            )
+        return f"🎉 정답이에요! — {self._answer_label()}", f"{praise}\n{reward_line}"
+
+    def _wrong_message(self, chosen: QuizChoiceButton, outcome: QuizOutcome) -> tuple[str, str]:
+        return (
+            f"😅 아쉬워요! — 정답은 {self._answer_label()}",
+            f"고르신 답은 **{chosen.label}** 였어요.\n"
+            "손 모양을 한 번 더 따라 해 보고 다시 도전해 봐요! 💪\n"
+            f"{notes_notice(outcome)}",
+        )
+
+    def _timeout_message(self, outcome: QuizOutcome) -> tuple[str, str]:
+        return (
+            f"⏰ 시간 초과! — 정답은 {self._answer_label()}",
+            f"다음엔 꼭 맞혀 봐요! 🤟\n{notes_notice(outcome)}",
+        )
 
     def _finish_embed(self) -> None:
         """정답 공개 후에만 설명 전문과 링크를 붙입니다."""
@@ -456,7 +574,7 @@ class SignQuizView(discord.ui.View):
         links = link_field_value(self.answer, include_detail=True)
         if links:
             self.embed.add_field(name="🔗 바로가기", value=links, inline=False)
-        self.embed.set_footer(text="한 문제 더 풀어 볼까요? /수어퀴즈 🤟")
+        self.embed.set_footer(text=self.finish_footer)
 
     async def on_error(
         self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item
@@ -467,6 +585,91 @@ class SignQuizView(discord.ui.View):
             await interaction.followup.send(msg, ephemeral=True)
         else:
             await interaction.response.send_message(msg, ephemeral=True)
+
+
+class ReviewQuizView(SignQuizView):
+    """
+    /복습퀴즈 문제. 버튼 · 시간 초과 · 비공개 처리 · 남의 클릭 차단은 SignQuizView 그대로이고,
+    기록과 채점 문구만 다릅니다.
+      - 정답          : 오답노트에서 해결(마스터) + 하루 MAX_DAILY_REVIEW_REWARDS 회까지 복습 보상
+      - 오답·시간 초과 : 오답노트 누적 횟수 +1 (해결될 때까지 계속 출제 대상)
+    """
+
+    command_hint = "/복습퀴즈"
+    finish_footer = "다음 복습 문제도 풀어 볼까요? /복습퀴즈 · 남은 오답은 /오답노트 🤟"
+
+    async def _record(self, is_correct: bool) -> QuizOutcome:
+        word_id = self.answer["word_id"]
+        try:
+            if is_correct:
+                mastered, granted, used, user = await self.db.record_review_correct(
+                    self.owner.id,
+                    word_id,
+                    today_kst(),
+                    points=REVIEW_REWARD_POINTS,
+                    exp=REVIEW_REWARD_EXP,
+                    max_daily_rewards=MAX_DAILY_REVIEW_REWARDS,
+                )
+                return QuizOutcome(granted=granted, used_today=used, user=user, mastered=mastered)
+            wrong_count = await self.db.record_quiz_wrong(
+                self.owner.id, word_id, quiz_type=QUIZ_TYPE_REVIEW
+            )
+            return QuizOutcome(wrong_count=wrong_count)
+        except Exception:
+            log.exception("복습 퀴즈 기록 저장 실패 (user=%s, word=%s)", self.owner.id, word_id)
+            return QuizOutcome(used_today=-1)
+
+    def _correct_message(self, outcome: QuizOutcome) -> tuple[str, str]:
+        if outcome.failed:
+            return f"🎉 정답이에요! — {self._answer_label()}", SAVE_FAILED_NOTICE
+        if not outcome.mastered:
+            # 같은 단어로 띄운 다른 /복습퀴즈 에서 방금 해결된 경우 (해결 1번에 보상은 1번만 드려요)
+            return (
+                f"✅ 정답이에요! — {self._answer_label()}",
+                "이 단어는 방금 다른 복습 문제에서 이미 해결됐어요. (해결 1번에 보상은 1번만 드려요)",
+            )
+
+        headline = (
+            f"🎉 **{self.answer['word_name']}** 단어를 완벽히 복습하여 마스터했습니다! "
+            "(오답노트에서 해결됨)"
+        )
+        if outcome.granted and outcome.user is not None:
+            reward_line = (
+                f"✨ 포인트 **+{REVIEW_REWARD_POINTS}** · 경험치 **+{REVIEW_REWARD_EXP}** "
+                f"(오늘 복습 보상 {outcome.used_today}/{MAX_DAILY_REVIEW_REWARDS}회)\n"
+                f"현재 포인트 {outcome.user['points']} · 경험치 {outcome.user['exp']}"
+            )
+        else:
+            # 상한선 도달: 해결 처리는 됐고 보상만 0 입니다.
+            reward_line = (
+                f"🎯 오늘의 복습 보상 상한선"
+                f"({MAX_DAILY_REVIEW_REWARDS}/{MAX_DAILY_REVIEW_REWARDS}회)에 달성하여 "
+                "보상 없이 학습 기록만 남습니다."
+            )
+        return f"🏆 복습 성공! — {self._answer_label()}", f"{headline}\n{reward_line}"
+
+    def _wrong_message(self, chosen: QuizChoiceButton, outcome: QuizOutcome) -> tuple[str, str]:
+        return (
+            f"😅 아쉬워요! — 정답은 {self._answer_label()}",
+            f"고르신 답은 **{chosen.label}** 였어요.\n"
+            "아래 설명과 영상으로 한 번 더 익혀 봐요! 💪\n"
+            f"{self._still_open_notice(outcome)}",
+        )
+
+    def _timeout_message(self, outcome: QuizOutcome) -> tuple[str, str]:
+        return (
+            f"⏰ 시간 초과! — 정답은 {self._answer_label()}",
+            f"아래 설명과 영상으로 한 번 더 익혀 봐요! 🤟\n{self._still_open_notice(outcome)}",
+        )
+
+    @staticmethod
+    def _still_open_notice(outcome: QuizOutcome) -> str:
+        if outcome.failed:
+            return "⚠️ 기록을 저장하지 못했어요. 잠시 후 다시 도전해 주세요!"
+        return (
+            f"📒 이 단어 오답 **{outcome.wrong_count}**회 · "
+            "해결될 때까지 `/복습퀴즈` 에 다시 나와요."
+        )
 
 
 # ── Cog ─────────────────────────────────────────────────────────
@@ -646,15 +849,11 @@ class SignLanguage(commands.Cog, name="수어"):
         if not await safe_defer(interaction, ephemeral=True):
             return
 
-        # 30% 확률로 '틀린 뒤 아직 못 맞힌 단어'에서 정답을 고릅니다. (오답 복습)
+        # 30% 확률로 오답노트의 미해결 단어에서 정답을 고릅니다. (오답 복습)
         answer = await self._pick_review_answer(interaction.user.id)
         is_review = answer is not None
         if answer is not None:
-            # 보기 = 복습 단어 + 이름이 다른 무작위 단어들 (같은 이름이 보기에 두 번 뜨지 않게)
-            others = await self.db.get_random_words(QUIZ_CHOICES)
-            distractors = [w for w in others if w["word_name"] != answer["word_name"]]
-            choices = [answer, *distractors[: QUIZ_CHOICES - 1]]
-            random.shuffle(choices)  # 정답이 늘 첫 번째 버튼에 오지 않도록 섞습니다
+            choices = await self._choices_with(answer)
         else:
             # 보기에 같은 단어명이 두 번 나오지 않도록 단어명 기준으로 뽑습니다.
             choices = await self.db.get_random_words(QUIZ_CHOICES)
@@ -676,25 +875,14 @@ class SignLanguage(commands.Cog, name="수어"):
                 return
             answer = random.choice(playable)
 
-        # 정답이 드러날 만한 정보(단어명·분류·사전 주소)는 넣지 않습니다.
-        intro = "🔁 **복습 문제!** 전에 틀렸던 단어가 나왔어요.\n" if is_review else ""
-        embed = discord.Embed(
+        embed, content = build_quiz_embed(
+            answer,
             title="🧩 수어 퀴즈!",
-            description=(
-                f"{intro}이 수어 동작은 어떤 뜻일까요?\n"
-                f"**{QUIZ_TIMEOUT}초** 안에 아래 버튼에서 골라 주세요!"
+            intro="🔁 **복습 문제!** 오답노트에 있던 단어가 나왔어요.\n" if is_review else "",
+            footer=(
+                f"정답 시 포인트 +{REWARD_POINTS} · 경험치 +{REWARD_EXP}"
+                f" · 보상은 하루 {MAX_DAILY_QUIZ_REWARDS}회까지"
             ),
-            color=COLOR_QUIZ,
-        )
-        content = set_media(embed, _row_get(answer, "image_url"), answer["video_url"])
-
-        # 영상 링크는 마스크 링크로만 (주소에 단어가 드러나지 않습니다)
-        video_link = masked("🎬 영상으로 문제 보기", answer["video_url"])
-        if video_link:
-            embed.add_field(name="문제 영상", value=video_link, inline=False)
-        embed.set_footer(
-            text=f"정답 시 포인트 +{REWARD_POINTS} · 경험치 +{REWARD_EXP}"
-                 f" · 보상은 하루 {MAX_DAILY_QUIZ_REWARDS}회까지"
         )
 
         view = SignQuizView(self.db, interaction.user, answer, choices, embed, is_review=is_review)
@@ -709,14 +897,128 @@ class SignLanguage(commands.Cog, name="수어"):
 
     async def _pick_review_answer(self, user_id: int) -> Row | None:
         """
-        REVIEW_PROBABILITY(30%) 확률로 오답 복습 문제의 정답을 고릅니다.
-        오답 이력이 없거나, 보여 줄 미디어가 있는 오답이 없으면 None → 기존처럼 무작위 출제.
+        REVIEW_PROBABILITY(30%) 확률로 오답노트의 미해결 단어에서 복습 문제의 정답을 고릅니다.
+        미해결 오답이 없거나, 보여 줄 미디어가 있는 오답이 없으면 None → 기존처럼 무작위 출제.
         """
         if random.random() >= REVIEW_PROBABILITY:
             return None  # 70% 는 DB를 조회하지 않고 바로 무작위 출제
         wrong_words = await self.db.get_user_wrong_words(user_id, limit=REVIEW_POOL_SIZE)
         playable = [w for w in wrong_words if has_quiz_media(w)]
         return random.choice(playable) if playable else None
+
+    async def _choices_with(self, answer: Row) -> list[Row]:
+        """보기 = 정답 + 이름이 다른 무작위 단어들. (같은 이름이 보기에 두 번 뜨지 않게, 섞어서)"""
+        others = await self.db.get_random_words(QUIZ_CHOICES)
+        distractors = [w for w in others if w["word_name"] != answer["word_name"]]
+        choices = [answer, *distractors[: QUIZ_CHOICES - 1]]
+        random.shuffle(choices)  # 정답이 늘 첫 번째 버튼에 오지 않도록 섞습니다
+        return choices
+
+    # ── /오답노트 ────────────────────────────────────────────────
+    @app_commands.command(
+        name="오답노트",
+        description="내가 틀린 수어 단어를 많이 틀린 순서로 모아 봅니다. (나만 보여요)",
+    )
+    @app_commands.checks.cooldown(1, COOLDOWN_SECONDS)
+    async def wrong_notes(self, interaction: discord.Interaction) -> None:
+        # 나만 보이는 메시지. 중복 응답·만료(10062)면 아무것도 하지 않고 끝냅니다.
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+
+        user_id = interaction.user.id
+        words = await self.db.get_user_wrong_words(user_id, limit=None)
+        mastered = await self.db.count_mastered_notes(user_id)
+
+        if not words:
+            embed = discord.Embed(
+                title="📒 오답노트", description=NOTES_EMPTY_MESSAGE, color=COLOR_NOTES
+            )
+            embed.set_footer(
+                text=f"지금까지 복습으로 해결한 단어 {mastered}개 🏆" if mastered
+                else "/수어퀴즈 에서 틀린 단어가 여기에 자동으로 모여요 🤟"
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        owner_name = interaction.user.display_name
+
+        async def render_page(page: int) -> discord.Embed:
+            """처음에 한 번 불러온 오답 목록을 NOTES_PAGE_SIZE 개씩 잘라 보여 줍니다."""
+            offset = page * NOTES_PAGE_SIZE
+            return build_notes_page_embed(
+                words[offset: offset + NOTES_PAGE_SIZE],
+                owner_name=owner_name, total=len(words), mastered=mastered, offset=offset,
+            )
+
+        # 마지막 조작 후 NOTES_PAGINATOR_TIMEOUT(180초)가 지나면 버튼이 모두 잠깁니다.
+        view = SignPaginatorView(
+            interaction.user,
+            page_count(len(words), NOTES_PAGE_SIZE),
+            render_page,
+            timeout=NOTES_PAGINATOR_TIMEOUT,
+        )
+        await view.start(interaction, ephemeral=True)
+
+    # ── /복습퀴즈 ────────────────────────────────────────────────
+    @app_commands.command(
+        name="복습퀴즈",
+        description="오답노트에 담긴 단어만 골라 다시 풀어요. 맞히면 오답노트에서 해결돼요!",
+    )
+    @app_commands.checks.cooldown(1, COOLDOWN_SECONDS)
+    async def review_quiz(self, interaction: discord.Interaction) -> None:
+        # /수어퀴즈 처럼 퀴즈 카드부터 채점 결과까지 본인에게만 보입니다. (ephemeral)
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+
+        notes = await self.db.get_user_wrong_words(
+            interaction.user.id, limit=REVIEW_QUIZ_POOL_SIZE
+        )
+        if not notes:
+            # 미해결 오답이 없으면 퀴즈를 만들지 않고 바로 안내합니다.
+            embed = discord.Embed(
+                title="📒 복습 퀴즈", description=NOTES_EMPTY_MESSAGE, color=COLOR_NOTES
+            )
+            embed.set_footer(text="/수어퀴즈 에서 틀린 단어가 생기면 여기서 다시 풀 수 있어요 🤟")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        playable = [w for w in notes if has_quiz_media(w)]
+        if not playable:
+            await interaction.followup.send(
+                "오답노트 단어 중에 문제로 보여 드릴 수어 사진·영상이 있는 단어가 없어요 😢\n"
+                "`/오답노트` 의 사전 링크로 먼저 복습해 보세요!",
+                ephemeral=True,
+            )
+            return
+
+        # 많이 틀린 단어일수록 자주 나오도록 누적 오답 횟수를 가중치로 씁니다.
+        answer = random.choices(playable, weights=[w["wrong_count"] for w in playable], k=1)[0]
+        choices = await self._choices_with(answer)
+        if len(choices) < 2:
+            await interaction.followup.send(
+                "퀴즈를 내려면 단어가 최소 2개는 있어야 해요! 📚", ephemeral=True
+            )
+            return
+
+        embed, content = build_quiz_embed(
+            answer,
+            title="📒 복습 퀴즈!",
+            intro=(
+                "오답노트에서 골라 온 문제예요. "
+                f"(지금까지 **{answer['wrong_count']}번** 틀린 단어)\n"
+            ),
+            footer=(
+                f"맞히면 오답노트에서 해결 · 포인트 +{REVIEW_REWARD_POINTS} · "
+                f"경험치 +{REVIEW_REWARD_EXP} · 보상은 하루 {MAX_DAILY_REVIEW_REWARDS}회까지"
+            ),
+        )
+        embed.color = COLOR_NOTES
+
+        view = ReviewQuizView(self.db, interaction.user, answer, choices, embed)
+        # /수어퀴즈 와 같은 이유로 ephemeral + wait=True (시간 초과 때 같은 비공개 메시지를 고침)
+        view.message = await interaction.followup.send(
+            content=content, embed=embed, view=view, ephemeral=True, wait=True
+        )
 
     # ── /단어장저장 ──────────────────────────────────────────────
     @app_commands.command(
