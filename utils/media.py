@@ -75,10 +75,10 @@ PHOTO_MISSING_NOTICE = (
 )
 PHOTO_FILENAME = "sign"          # 첨부 파일 이름 (확장자는 받은 파일을 보고 붙임 · 단어명이 드러나지 않음)
 # 국립국어원에 사진을 요청할 때의 헤더 - 일반 브라우저와 같은 모양으로 보냅니다.
-# 운영 VM 에서 curl 기본 요청은 200 으로 받았는데, 'LeemisutBot' 이 든 User-Agent 로 보낸 요청은
-# 응답 없이 모두 시간 초과됐습니다(2026-10-07). 디스코드 프록시('Discordbot')도 사진을 못 가져왔으므로
-# 이름에 bot 이 든 요청을 방화벽이 버리는 것으로 보고 브라우저 헤더를 씁니다.
-# (사진마다 처음 한 번만 받고 디스크에 보관하므로 국립국어원에 가는 요청 수는 많지 않습니다)
+# ⚠️ 운영 VM(Oracle 오사카)은 헤더와 관계없이 국립국어원에 연결 자체가 안 됩니다. (해외 IP 차단 ·
+#    curl 도 브라우저 헤더 · 봇 헤더 모두 15초 연결 시간 초과 · 2026-10-07) 그래서 VM 의 사진은
+#    국내 PC 에서 scripts/bulk_download_images.py 로 미리 받아 옮겨 둔 디스크 캐시로 보여 줍니다.
+#    이 헤더는 국내 PC 의 일괄 다운로드도 같은 PhotoFetcher 로 받기 때문에 브라우저와 같은 모양으로 둡니다.
 PHOTO_REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -274,6 +274,10 @@ class PhotoFetcher:
         except asyncio.TimeoutError:
             return None
 
+    async def is_cached(self, url: str) -> bool:
+        """이미 메모리나 디스크에 있는 사진인지. (국립국어원에 요청하지 않습니다)"""
+        return url in self._memory or await self._disk_path(url) is not None
+
     async def prefetch(self, urls: list[str], *, concurrency: int = 2) -> dict[str, int]:
         """
         사진 여러 장을 미리 받아 디스크에 쌓아 둡니다. (기다리는 사람이 없으므로 시간을 넉넉히)
@@ -283,7 +287,7 @@ class PhotoFetcher:
         gate = asyncio.Semaphore(concurrency)  # 느린 서버에 한꺼번에 몰리지 않도록
 
         async def one(url: str) -> None:
-            if url in self._memory or await self._disk_path(url) is not None:
+            if await self.is_cached(url):
                 stats["cached"] += 1
                 return
             self._failed_at.pop(url, None)  # 미리 받기는 최근 실패 기록과 관계없이 한 번 더 시도

@@ -89,7 +89,8 @@
   - 임베드 **사진은 봇이 직접 받아 첨부 파일로 올립니다** (`attachment://sign.jpg`). 주소만 넘기면 디스코드 서버가 국립국어원에서 사진을 받아 와야 하는데, 운영 환경에서 사진이 표시되지 않았기 때문입니다.
   - **디스크 영구 캐시**: 받은 사진은 `data/cache/images/` 에 저장해 두고, 다음부터는 국립국어원을 거치지 않고 디스크에서 바로 꺼냅니다. (찾는 순서: 메모리 512장 → 디스크 → 국립국어원 · 전체 3,600장을 모아도 수십 MB)
   - 국립국어원에서 받을 때는 한 번에 **5초**까지 기다리고, 시간 초과 · 연결 끊김 · 5xx 면 **한 번 더** 받습니다. 끝내 받지 못한 주소는 10분 동안 다시 시도하지 않습니다.
-  - 요청은 일반 브라우저와 같은 헤더(User-Agent · Referer · Accept)로 보냅니다. 운영 VM 에서 curl 은 사진을 받았는데 이름에 `Bot` 이 든 요청은 응답 없이 시간 초과됐기 때문입니다. 사진마다 처음 한 번만 받고 디스크에 보관합니다.
+  - 요청은 일반 브라우저와 같은 헤더(User-Agent · Referer · Accept)로 보냅니다.
+  - ⚠️ 운영 VM(Oracle 오사카 리전)은 국립국어원이 해외 IP 를 막아 **연결 자체가 안 됩니다.** VM 의 사진은 국내 PC 에서 일괄로 받아 옮긴 디스크 캐시로 보여 줍니다. → [수형 사진 캐시 옮기기](#️-수형-사진-캐시-옮기기-국내-pc--vm)
   - **오늘의 수어 미리 받기**: 매일 자정(KST)과 봇이 켜질 때, 최근 14일 안에 `/오늘의수어` 를 쓴 유저들의 오늘 단어 사진을 미리 받아 둡니다. (단어가 유저마다 달라서 유저 기준으로 고르며, 기다리는 사람이 없으니 한 번에 20초까지 기다립니다)
   - 끝내 사진을 받지 못하면 사진 칸을 비우고 `📷 사진` 칸에 "국립국어원 미디어 서버가 늦게 응답해 사진을 불러오지 못했어요" 안내를 붙입니다.
   - 사진이 없거나 주소가 이상하면(공백 · 잘못된 형식 · 2,048자 초과, 버튼은 512자 초과) 미리 걸러 사진 없이 설명 · 링크만 보여 줍니다.
@@ -119,6 +120,8 @@ Leemisut-bot/
 ├── main.py                # 엔트리 포인트 (Cog 자동 로드 · DB 연결 · 슬래시 명령어 동기화)
 ├── database.py            # DB 계층 (PostgreSQL · SQLite 이중 지원 · 스키마 · 캐시 · 퀴즈 기록 · 오답노트 · 단어장)
 ├── migrate_to_cloud.py    # 로컬 SQLite ➔ 클라우드 PostgreSQL 데이터 이전 스크립트
+├── scripts/
+│   └── bulk_download_images.py  # 수형 사진 일괄 다운로드 (국내 PC ➔ 압축 ➔ VM 디스크 캐시)
 ├── cogs/
 │   ├── general.py         # /안녕 · /명언 · /격언 · /내정보
 │   ├── sign_language.py   # /오늘의수어 · /수어검색 · /수어퀴즈 · /오답노트 · /복습퀴즈 · /단어장저장 · /수어단어장
@@ -260,6 +263,61 @@ journalctl -u leemisut -f
 
 > ⚠️ **`.env` 는 저장소에 없습니다.** VM을 새로 만들었다면 `git clone` 뒤 `.env` 를 직접 만들어야 합니다. (`DISCORD_TOKEN` · `DATABASE_URL` · `KSL_API_KEY` · `ADMIN_USER_IDS`)  
 > ⚠️ 봇은 **한 번에 한 곳에서만** 켜 주세요. VM에서 돌리는 동안 집 PC에서도 켜면 하나의 상호작용을 두 봇이 함께 받아 슬래시 명령어가 실패합니다.
+
+## 🖼️ 수형 사진 캐시 옮기기 (국내 PC → VM)
+
+국립국어원(`sldict.korean.go.kr`)은 해외 IP 를 막아 **운영 VM(Oracle 오사카 리전)에서는 사진을 받을 수 없습니다.** 국내 인터넷을 쓰는 PC 에서 사진 전체를 받아 VM 으로 옮기면, 봇은 국립국어원에 가지 않고 디스크에 있는 사진을 바로 씁니다. (전체 약 3,600장 · 수십 MB)
+
+> 스크립트는 봇과 같은 코드(`utils/media.py` 의 `pick_image` · `PhotoFetcher`)로 주소를 고르고 저장하므로, 파일 이름(`data/cache/images/{주소 해시}.jpg`)이 봇이 찾는 이름과 똑같습니다.
+
+### 1. 국내 PC 에서 받기
+PC 의 저장소를 최신으로 맞추고, `.env` 의 `DATABASE_URL` 이 **VM 과 같은 운영 DB** 를 가리키는지 확인한 뒤 실행합니다. (`DISCORD_TOKEN` 은 필요 없습니다)
+
+```bash
+git pull
+pip install -r requirements.txt
+python scripts/bulk_download_images.py
+```
+
+진행 막대가 100% 가 되면 `data/images_cache.tar.gz` 로 압축됩니다. 실패한 사진이 있으면 같은 명령을 한 번 더 실행해 주세요. 이미 받은 사진은 건너뛰고 실패한 사진만 다시 받습니다.
+
+| 옵션 | 설명 |
+|---|---|
+| `--concurrency 15` | 동시에 받을 장수 (1~15, 기본 10) |
+| `--timeout 30` | 한 번 요청에 기다리는 초 (기본 15 · 실패하면 1번 더 시도) |
+| `--dsn "postgresql://..."` | `.env` 대신 DB 주소를 직접 지정 |
+| `--no-archive` | 압축하지 않고 받기만 |
+
+> ⚠️ PC 에서 `python main.py`(봇)는 켜지 마세요. VM 의 봇과 같은 토큰이라 슬래시 명령어가 `10062` 로 실패합니다. 이 스크립트는 DB 를 읽기만 하고 디스코드에는 접속하지 않습니다.
+
+### 2. VM 으로 보내기
+**Windows (PowerShell)**
+```powershell
+scp -i "$HOME\.ssh\오라클_키파일.key" data\images_cache.tar.gz ubuntu@<VM_공인_IP>:~/
+```
+**macOS · Linux**
+```bash
+scp -i ~/.ssh/오라클_키파일.key data/images_cache.tar.gz ubuntu@<VM_공인_IP>:~/
+```
+> 💡 Windows 에서 `UNPROTECTED PRIVATE KEY FILE` 오류가 나면 키 파일 권한을 본인만 읽게 바꿔 주세요:
+> `icacls "$HOME\.ssh\오라클_키파일.key" /inheritance:r /grant:r "$($env:USERNAME):R"`
+
+### 3. VM 에서 풀기
+```bash
+mkdir -p ~/Leemisut-bot/data/cache
+tar -xzf ~/images_cache.tar.gz -C ~/Leemisut-bot/data/cache/
+ls ~/Leemisut-bot/data/cache/images | wc -l
+```
+마지막 숫자가 스크립트가 알려 준 장수와 같으면 됩니다. (`sudo` 없이 풀어야 봇이 파일을 읽을 수 있습니다)
+
+### 4. 봇 다시 시작 · 확인
+```bash
+sudo systemctl restart leemisut
+journalctl -u leemisut -f
+```
+시작하고 조금 뒤 `🖼️ 오늘의 수어 사진 미리 받기 … 이미 있음 N · 새로 받음 0 · 실패 0` 이 보이면 캐시를 쓰고 있는 것입니다. 확인이 끝나면 `rm ~/images_cache.tar.gz` 로 압축 파일을 지워 주세요.
+
+> 📌 나중에 `/수어전체동기화` 로 새 단어가 생기면 PC 에서 1~3 단계를 다시 하면 됩니다. (이미 받은 사진은 건너뜁니다)
 
 ## ☁️ 클라우드 DB 연동 (Supabase / Neon)
 
