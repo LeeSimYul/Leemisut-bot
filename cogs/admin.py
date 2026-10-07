@@ -34,6 +34,14 @@ ROWS_PER_PAGE = 100        # 이 API의 페이지당 최대 건수
 PROGRESS_INTERVAL = 3.0    # 진행 상황 메시지 수정 간격(초) - 너무 잦으면 요청 제한에 걸립니다
 LIST_PAGE_SIZE = 10        # /수어목록 한 페이지에 보여 줄 단어 수
 
+# 이 프로세스가 더는 응답할 수 없는 상호작용의 디스코드 오류 코드
+#   10062 Unknown interaction                      : 3초가 지났거나 다른 프로세스가 먼저 응답함
+#   40060 Interaction has already been acknowledged : 다른 프로세스가 먼저 응답함
+# 권한 체크는 응답 전에 바로 끝나므로, 여기서 이 코드가 나오면 거의 항상 같은 토큰으로 켜진
+# 봇이 하나 더 있다는 뜻입니다. 그쪽이 이미 응답했으므로 이 프로세스는 안내를 보낼 수 없습니다.
+UNANSWERABLE_CODES = (10062, 40060)
+DUPLICATE_BOT_HINT = "같은 토큰으로 다른 곳(집 PC · 예전 서버 등)에서 켜진 봇이 있는지 확인해 주세요."
+
 COLOR_ADMIN = discord.Color.dark_teal()
 COLOR_FAIL = discord.Color.red()
 COLOR_PROGRESS = discord.Color.blurple()
@@ -67,6 +75,11 @@ def _fail_embed(exc: Exception) -> discord.Embed:
 
 class NotBotAdmin(app_commands.CheckFailure):
     """서버 관리자이지만 .env 의 ADMIN_USER_IDS 목록에는 없는 사람이 실행했을 때."""
+
+
+def command_label(interaction: discord.Interaction) -> str:
+    """로그에 남길 명령어 이름."""
+    return interaction.command.name if interaction.command else "알 수 없음"
 
 
 def bot_admin_only():
@@ -417,8 +430,12 @@ class Admin(commands.Cog, name="관리"):
             msg = "이 명령어는 서버 관리자만 사용할 수 있어요! 🔒"
         elif isinstance(error, NotBotAdmin):
             msg = "이 명령어는 등록된 봇 관리자만 사용할 수 있어요! 🔐"
-        elif isinstance(original, discord.NotFound) and original.code == 10062:
-            log.warning("만료된 상호작용 (10062): %s", interaction.command)
+        elif isinstance(original, discord.HTTPException) and original.code in UNANSWERABLE_CODES:
+            # defer() 단계에서 실패 - 응답을 보낼 대상이 없으므로 로그만 남깁니다.
+            log.warning(
+                "응답할 수 없는 상호작용 (code=%s): /%s · %s",
+                original.code, command_label(interaction), DUPLICATE_BOT_HINT,
+            )
             return
         else:
             log.exception("관리자 명령어 처리 중 오류", exc_info=error)
@@ -429,8 +446,18 @@ class Admin(commands.Cog, name="관리"):
                 await interaction.followup.send(msg, ephemeral=True)
             else:
                 await interaction.response.send_message(msg, ephemeral=True)
-        except discord.HTTPException:
-            log.warning("오류 안내 메시지를 보내지 못했습니다.")
+        except discord.HTTPException as exc:
+            if exc.code in UNANSWERABLE_CODES:
+                log.warning(
+                    "오류 안내를 보내지 못했습니다: 이미 다른 곳에서 응답한 상호작용입니다 "
+                    "(code=%s · /%s). %s",
+                    exc.code, command_label(interaction), DUPLICATE_BOT_HINT,
+                )
+            else:
+                log.warning(
+                    "오류 안내 메시지를 보내지 못했습니다. (HTTP %s · code=%s · /%s)",
+                    exc.status, exc.code, command_label(interaction),
+                )
 
 
 async def setup(bot: commands.Bot) -> None:

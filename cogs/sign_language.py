@@ -13,7 +13,8 @@ cogs/sign_language.py
 ■ 미디어 (utils/media.py)
    - 수형 사진은 임베드 본문 아래 이미지(set_image)로 띄웁니다. 원본이 215×161 이라
      오른쪽 위 썸네일(80×80)로 줄이면 모바일에서 손 모양이 보이지 않습니다.
-   - 국립국어원 주소는 내보낼 때만 https 로 바꾸고, DB 에 저장된 원본은 그대로 둡니다.
+   - 국립국어원 링크(버튼 · 제목 · 글 링크)는 내보낼 때만 https 로 바꾸고, DB 원본은 그대로 둡니다.
+     사진은 디스코드가 직접 받아 오므로 원본(http) 주소 그대로 보냅니다.
    - 사진이 없거나 주소가 이상하면 사진 없이 설명 · 링크만 보여 줍니다.
      디스코드가 그래도 400 으로 거절하면 사진 · 링크 버튼만 빼고 한 번 더 보냅니다.
 ■ 정답 은닉 원칙
@@ -171,7 +172,7 @@ def _row_get(row: Row, key: str, default: str = "") -> str:
 
 
 def word_image(word: Row) -> str:
-    """임베드에 띄울 수형 사진 주소. (https 로 다듬은 값, 없으면 빈 문자열)"""
+    """임베드에 띄울 수형 사진 주소. (검증만 한 원본 주소, 없으면 빈 문자열)"""
     return pick_image(_row_get(word, "image_url"), word["video_url"])
 
 
@@ -239,7 +240,8 @@ def set_media(embed: discord.Embed, word: Row) -> str | None:
         embed.set_image(url=image)
 
     if SHOW_VIDEO_PLAYER and is_video_url(word["video_url"]):
-        return secure_url(word["video_url"])
+        # 본문 영상 플레이어도 디스코드가 직접 받아 오므로 사진처럼 원본 주소를 씁니다.
+        return secure_url(word["video_url"], upgrade=False)
     return None
 
 

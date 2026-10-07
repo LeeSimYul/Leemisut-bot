@@ -3,9 +3,13 @@ utils/media.py
 조교 이미숫 - 임베드 사진 · 링크 버튼에 넣을 주소를 다듬고, 디스코드가 거절하면 미디어를 빼고 다시 보냅니다.
 
 ■ DB 는 그대로 둡니다
-  국립국어원 주소는 http:// 로 저장돼 있어서 화면에 내보낼 때만 https:// 로 바꿉니다. (secure_url)
+  국립국어원 주소는 http:// 로 저장돼 있습니다. 사람이 브라우저로 여는 링크(버튼 · 제목 · 글 링크)만
+  내보낼 때 https:// 로 바꿉니다. (secure_url)
   DB 를 바꾸지 않는 이유: 동기화는 (단어명, 영상 주소) 원본으로 중복을 판정하므로,
   저장된 주소를 바꾸면 다음 동기화 때 같은 단어가 한 번 더 들어옵니다.
+■ 임베드 사진은 원본 주소(http) 그대로 보냅니다 (pick_image)
+  사진은 디스코드 미디어 프록시가 직접 받아 옵니다. 운영 서버에서 https 로 바꾼 국립국어원 사진이
+  임베드에 나타나지 않아(2026-10-07) 사진에는 https 변환을 적용하지 않습니다.
 ■ 디스코드가 거절할 주소는 미리 걸러 냅니다 (빈 문자열 → 사진 · 버튼을 건너뛰고 글과 링크만)
   - http(s) 가 아니거나 호스트가 없는 주소, 공백 · 제어 문자가 섞인 주소
   - 임베드 주소 EMBED_URL_LIMIT(2,048자) · 링크 버튼 주소 BUTTON_URL_LIMIT(512자) 초과
@@ -46,12 +50,15 @@ def _upgradable(host: str) -> bool:
     return any(host == domain or host.endswith("." + domain) for domain in HTTPS_UPGRADE_DOMAINS)
 
 
-def secure_url(url: str | None, *, limit: int = EMBED_URL_LIMIT) -> str:
+def secure_url(url: str | None, *, limit: int = EMBED_URL_LIMIT, upgrade: bool = True) -> str:
     """
     디스코드로 내보내도 되는 주소로 다듬습니다. 쓸 수 없는 주소면 빈 문자열을 돌려줍니다.
+    upgrade=False 면 검증만 하고 http 를 https 로 바꾸지 않습니다. (디스코드가 직접 받아 오는 사진용)
 
     >>> secure_url("http://sldict.korean.go.kr/a.jpg")
     'https://sldict.korean.go.kr/a.jpg'
+    >>> secure_url("http://sldict.korean.go.kr/a.jpg", upgrade=False)
+    'http://sldict.korean.go.kr/a.jpg'
     >>> secure_url("sldict.korean.go.kr/a.jpg")
     ''
     """
@@ -66,7 +73,7 @@ def secure_url(url: str | None, *, limit: int = EMBED_URL_LIMIT) -> str:
     scheme = parts.scheme.lower()
     if scheme not in ("http", "https") or not host:
         return ""
-    if scheme == "http" and _upgradable(host):
+    if upgrade and scheme == "http" and _upgradable(host):
         text = "https" + text[len(parts.scheme):]
     return text if len(text) <= limit else ""
 
@@ -87,12 +94,12 @@ def is_video_url(url: str | None) -> bool:
 
 def pick_image(image_url: str | None, video_url: str | None) -> str:
     """
-    임베드에 띄울 수형 사진을 고릅니다. (https 로 다듬은 주소, 없으면 빈 문자열)
+    임베드에 띄울 수형 사진을 고릅니다. (검증만 한 원본 주소, 없으면 빈 문자열)
     사진이 없고 영상 자리에 gif 같은 사진이 들어온 단어는 그 사진을 씁니다.
     """
     for url in (image_url, video_url):
         if is_image_url(url):
-            return secure_url(url)
+            return secure_url(url, upgrade=False)
     return ""
 
 
