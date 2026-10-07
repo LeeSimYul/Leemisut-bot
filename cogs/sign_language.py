@@ -13,8 +13,10 @@ cogs/sign_language.py
 ■ 미디어 (utils/media.py)
    - 수형 사진은 임베드 본문 아래 이미지(set_image)로 띄웁니다. 원본이 215×161 이라
      오른쪽 위 썸네일(80×80)로 줄이면 모바일에서 손 모양이 보이지 않습니다.
+   - 사진은 봇이 직접 받아 첨부 파일(attachment://sign.jpg)로 올립니다. (PhotoFetcher)
+     디스코드 프록시가 국립국어원 서버에서 사진을 받아 오지 못해도 보이게 하려는 것입니다.
+     봇도 받지 못하면 원본(http) 주소를 그대로 넘겨 디스코드가 직접 시도하게 둡니다.
    - 국립국어원 링크(버튼 · 제목 · 글 링크)는 내보낼 때만 https 로 바꾸고, DB 원본은 그대로 둡니다.
-     사진은 디스코드가 직접 받아 오므로 원본(http) 주소 그대로 보냅니다.
    - 사진이 없거나 주소가 이상하면 사진 없이 설명 · 링크만 보여 줍니다.
      디스코드가 그래도 400 으로 거절하면 사진 · 링크 버튼만 빼고 한 번 더 보냅니다.
 ■ 정답 은닉 원칙
@@ -51,6 +53,7 @@ from discord.ext import commands
 
 from database import QUIZ_TYPE_REVIEW, Database, Row
 from utils.media import (
+    PhotoFetcher,
     is_video_url,
     link_buttons,
     link_view,
@@ -726,7 +729,11 @@ class NotesPaginatorView(SignPaginatorView):
     """
 
     def __init__(
-        self, owner: discord.abc.User, words: list[Row], render_page: PageRenderer
+        self,
+        owner: discord.abc.User,
+        words: list[Row],
+        render_page: PageRenderer,
+        photos: PhotoFetcher,
     ) -> None:
         super().__init__(
             owner,
@@ -735,6 +742,7 @@ class NotesPaginatorView(SignPaginatorView):
             timeout=NOTES_PAGINATOR_TIMEOUT,
         )
         self.words = words
+        self.photos = photos
         self.detail_select = NoteDetailSelect()
         self.add_item(self.detail_select)
 
@@ -764,9 +772,10 @@ class NotesPaginatorView(SignPaginatorView):
 
         word = self.words[index]
         embed, content = build_note_detail_embed(word)
+        photo = await self.photos.attach(embed)
         await send_with_media_fallback(
             interaction.followup.send,
-            embed=embed, view=word_link_view(word), content=content, ephemeral=True,
+            embed=embed, view=word_link_view(word), photo=photo, content=content, ephemeral=True,
         )
 
 
@@ -775,6 +784,11 @@ class SignLanguage(commands.Cog, name="수어"):
     def __init__(self, bot: commands.Bot, db: Database) -> None:
         self.bot = bot
         self.db = db
+        # 수형 사진을 봇이 직접 받아 첨부합니다. (명령어마다 defer 한 뒤에 부름)
+        self.photos = PhotoFetcher()
+
+    async def cog_unload(self) -> None:
+        await self.photos.close()
 
     # ── /오늘의수어 ──────────────────────────────────────────────
     @app_commands.command(
@@ -823,8 +837,10 @@ class SignLanguage(commands.Cog, name="수어"):
         embed.set_footer(
             text=f"{today:%Y년 %m월 %d일} · {interaction.user.display_name} 님의 오늘 단어예요 🤟"
         )
+        photo = await self.photos.attach(embed)
         await send_with_media_fallback(
-            interaction.followup.send, embed=embed, view=word_link_view(word), content=content
+            interaction.followup.send,
+            embed=embed, view=word_link_view(word), photo=photo, content=content,
         )
 
     # ── /수어검색 ────────────────────────────────────────────────
@@ -881,8 +897,10 @@ class SignLanguage(commands.Cog, name="수어"):
             )
             embed.description = f"{conditions} 으로 찾은 결과예요."
             embed.set_footer(text="다른 단어도 찾아볼까요? /수어검색 🤟")
+            photo = await self.photos.attach(embed)
             await send_with_media_fallback(
-                interaction.followup.send, embed=embed, view=word_link_view(word), content=content
+                interaction.followup.send,
+                embed=embed, view=word_link_view(word), photo=photo, content=content,
             )
             return
 
@@ -987,6 +1005,8 @@ class SignLanguage(commands.Cog, name="수어"):
             ),
         )
 
+        # 사진은 처음 보낼 때 첨부 파일로 올리고, 채점 화면으로 고칠 때는 그 파일이 그대로 남습니다.
+        photo = await self.photos.attach(embed)
         view = SignQuizView(self.db, interaction.user, answer, choices, embed, is_review=is_review)
         # wait=True 를 줘야 메시지 객체가 돌아옵니다 (시간 초과 시 수정에 필요)
         # ephemeral=True 로 보내도 채점 화면까지 계속 비공개로 유지됩니다.
@@ -996,7 +1016,7 @@ class SignLanguage(commands.Cog, name="수어"):
         # 디스코드가 사진 · 영상 버튼 때문에 거절(400)하면 그것만 빼고 보기 버튼은 둔 채 다시 보냅니다.
         view.message = await send_with_media_fallback(
             interaction.followup.send,
-            embed=embed, view=view, content=content, ephemeral=True, wait=True,
+            embed=embed, view=view, photo=photo, content=content, ephemeral=True, wait=True,
         )
 
     async def _pick_review_answer(self, user_id: int) -> Row | None:
@@ -1055,7 +1075,7 @@ class SignLanguage(commands.Cog, name="수어"):
             )
 
         # 마지막 조작 후 NOTES_PAGINATOR_TIMEOUT(180초)가 지나면 버튼 · 메뉴가 모두 잠깁니다.
-        view = NotesPaginatorView(interaction.user, words, render_page)
+        view = NotesPaginatorView(interaction.user, words, render_page, self.photos)
         await view.start(interaction, ephemeral=True)
 
     # ── /복습퀴즈 ────────────────────────────────────────────────
@@ -1113,11 +1133,12 @@ class SignLanguage(commands.Cog, name="수어"):
         )
         embed.color = COLOR_NOTES
 
+        photo = await self.photos.attach(embed)
         view = ReviewQuizView(self.db, interaction.user, answer, choices, embed)
         # /수어퀴즈 와 같은 이유로 ephemeral + wait=True (시간 초과 때 같은 비공개 메시지를 고침)
         view.message = await send_with_media_fallback(
             interaction.followup.send,
-            embed=embed, view=view, content=content, ephemeral=True, wait=True,
+            embed=embed, view=view, photo=photo, content=content, ephemeral=True, wait=True,
         )
 
     # ── /단어장저장 ──────────────────────────────────────────────

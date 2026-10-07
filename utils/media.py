@@ -7,25 +7,35 @@ utils/media.py
   내보낼 때 https:// 로 바꿉니다. (secure_url)
   DB 를 바꾸지 않는 이유: 동기화는 (단어명, 영상 주소) 원본으로 중복을 판정하므로,
   저장된 주소를 바꾸면 다음 동기화 때 같은 단어가 한 번 더 들어옵니다.
-■ 임베드 사진은 원본 주소(http) 그대로 보냅니다 (pick_image)
-  사진은 디스코드 미디어 프록시가 직접 받아 옵니다. 운영 서버에서 https 로 바꾼 국립국어원 사진이
-  임베드에 나타나지 않아(2026-10-07) 사진에는 https 변환을 적용하지 않습니다.
+■ 임베드 사진은 봇이 직접 받아 첨부 파일로 붙입니다 (PhotoFetcher)
+  주소만 넘기면(set_image(url=...)) 디스코드 미디어 프록시가 국립국어원 서버에서 사진을 받아 와야 하는데,
+  운영 서버에서 http · https 어느 쪽으로도 사진이 나타나지 않았습니다(2026-10-07).
+  그래서 봇이 사진을 받아 attachment://sign.jpg 로 함께 올립니다.
+  받지 못하면(2초 초과 · 404 · 사진이 아닌 응답) 원본 주소(http)를 그대로 넘겨 디스코드가 직접 시도하게 둡니다.
+  디스코드도 못 받으면 사진 칸 없이 설명 · 링크만 보입니다.
 ■ 디스코드가 거절할 주소는 미리 걸러 냅니다 (빈 문자열 → 사진 · 버튼을 건너뛰고 글과 링크만)
   - http(s) 가 아니거나 호스트가 없는 주소, 공백 · 제어 문자가 섞인 주소
   - 임베드 주소 EMBED_URL_LIMIT(2,048자) · 링크 버튼 주소 BUTTON_URL_LIMIT(512자) 초과
 ■ 그래도 디스코드가 400 으로 거절하면 사진 · 제목 링크 · 링크 버튼을 빼고 한 번 더 보냅니다.
   (send_with_media_fallback) 퀴즈 보기 버튼처럼 링크가 아닌 버튼은 그대로 둡니다.
-■ 주소를 글자로만 다듬고 네트워크 요청은 보내지 않습니다. (3초 응답 제한에 영향 없음)
-  주소 형식은 맞는데 파일이 없는(404) 사진은 디스코드가 오류 없이 받아 주므로 전송은 실패하지 않습니다.
+■ 주소 다듬기(secure_url 등)는 글자만 보고 네트워크 요청은 보내지 않습니다.
+  네트워크를 쓰는 것은 PhotoFetcher 뿐이고, 명령어가 응답을 미룬(defer) 뒤에만 불리므로
+  3초 응답 제한에 걸리지 않습니다. (한 장에 최대 PHOTO_FETCH_TIMEOUT 초)
 """
 from __future__ import annotations
 
+import asyncio
+import io
 import logging
 import re
+import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
+import aiohttp
 import discord
 
 log = logging.getLogger(__name__)
@@ -43,6 +53,16 @@ HTTPS_UPGRADE_DOMAINS = ("korean.go.kr",)
 
 # 주소에 있으면 안 되는 글자: 공백 · 제어 문자 · 꺾쇠 · 큰따옴표
 _UNSAFE_CHARS = re.compile(r'[\s\x00-\x1f\x7f<>"]')
+
+# ── 사진 직접 받기 (PhotoFetcher) ──
+PHOTO_FETCH_TIMEOUT = 2.0        # 초 - 한 장을 받는 데 기다리는 최대 시간
+PHOTO_MAX_BYTES = 2 * 1024 * 1024  # 이보다 큰 파일은 받지 않습니다 (수형 사진은 10~30KB)
+PHOTO_CACHE_SIZE = 512           # 메모리에 보관할 사진 수 (최대 수십 MB 이내)
+PHOTO_RETRY_AFTER = 600.0        # 초 - 받지 못한 주소는 이 시간 동안 다시 시도하지 않습니다
+PHOTO_FILENAME = "sign"          # 첨부 파일 이름 (확장자는 받은 파일을 보고 붙임 · 단어명이 드러나지 않음)
+PHOTO_USER_AGENT = "Mozilla/5.0 (compatible; LeemisutBot/1.0; +https://github.com/LeeSimYul/Leemisut-bot)"
+
+_reported_unusable: set[str] = set()  # 형식 오류로 건너뛴 사진 주소 (같은 경고를 반복하지 않도록)
 
 
 def _upgradable(host: str) -> bool:
@@ -100,7 +120,134 @@ def pick_image(image_url: str | None, video_url: str | None) -> str:
     for url in (image_url, video_url):
         if is_image_url(url):
             return secure_url(url, upgrade=False)
+    if image_url and image_url not in _reported_unusable and len(_reported_unusable) < 1000:
+        # DB 에 사진 주소가 있는데 쓸 수 없으면 사진 칸이 조용히 빠지므로 한 번은 알립니다.
+        _reported_unusable.add(image_url)
+        log.warning("저장된 사진 주소의 형식이 올바르지 않아 건너뜁니다: %r", image_url[:300])
     return ""
+
+
+# ── 사진 직접 받기 ──────────────────────────────────────────────
+@dataclass(frozen=True)
+class Photo:
+    """봇이 받아 둔 사진. 보낼 때마다 to_file() 로 새 파일 객체를 만듭니다. (파일 객체는 한 번 보내면 닫힘)"""
+
+    data: bytes
+    filename: str  # 'sign.jpg' 처럼 확장자까지
+
+    def to_file(self) -> discord.File:
+        return discord.File(io.BytesIO(self.data), filename=self.filename)
+
+
+class PhotoError(Exception):
+    """사진을 받았지만 쓸 수 없을 때. (HTTP 오류 · 너무 큼 · 사진이 아님)"""
+
+
+def sniff_image(data: bytes) -> str | None:
+    """파일 앞부분을 보고 사진 확장자를 정합니다. 사진이 아니면 None. (오류 안내 HTML 페이지 등)"""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+class PhotoFetcher:
+    """
+    임베드 사진을 봇이 직접 받아 첨부 파일로 바꿉니다. (attach)
+    - 한 장에 PHOTO_FETCH_TIMEOUT(2초) · PHOTO_MAX_BYTES(2MB) 까지만 받습니다.
+    - 받은 사진은 PHOTO_CACHE_SIZE 장까지 메모리에 두고 다시 씁니다.
+    - 받지 못한 주소는 PHOTO_RETRY_AFTER(10분) 동안 다시 시도하지 않습니다. (매번 2초씩 늦어지지 않게)
+    Cog 가 하나를 만들어 쓰고, Cog 를 내릴 때 close() 합니다.
+    """
+
+    def __init__(self) -> None:
+        self._session: aiohttp.ClientSession | None = None
+        self._cache: OrderedDict[str, Photo] = OrderedDict()
+        self._failed_at: dict[str, float] = {}
+        self._confirmed = False  # 첫 성공을 로그로 한 번 남겼는지
+
+    async def close(self) -> None:
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+
+    def _ensure_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(headers={"User-Agent": PHOTO_USER_AGENT})
+        return self._session
+
+    async def attach(self, embed: discord.Embed) -> Photo | None:
+        """
+        임베드에 걸린 사진 주소를 받아 와서 attachment:// 로 바꾸고 그 사진을 돌려줍니다.
+        보낼 때 send_with_media_fallback(..., photo=사진) 으로 함께 넘겨 주세요.
+        받지 못하면 None 이고, 임베드에는 원본 주소가 그대로 남습니다. (디스코드가 직접 시도)
+        """
+        url = embed.image.url
+        if not url or not url.startswith(("http://", "https://")):
+            return None
+        photo = await self.fetch(url)
+        if photo is not None:
+            embed.set_image(url=f"attachment://{photo.filename}")
+        return photo
+
+    async def fetch(self, url: str) -> Photo | None:
+        if url in self._cache:
+            self._cache.move_to_end(url)
+            return self._cache[url]
+        failed_at = self._failed_at.get(url)
+        if failed_at is not None and time.monotonic() - failed_at < PHOTO_RETRY_AFTER:
+            return None
+
+        started = time.monotonic()
+        try:
+            photo = await self._download(url)
+        except (aiohttp.ClientError, asyncio.TimeoutError, PhotoError) as exc:
+            self._failed_at[url] = time.monotonic()
+            reason = str(exc) or type(exc).__name__
+            if isinstance(exc, asyncio.TimeoutError):
+                reason = f"{PHOTO_FETCH_TIMEOUT:g}초 안에 받지 못함"
+            log.warning("수형 사진을 직접 받지 못해 주소만 넘깁니다: %s (%s)", url, reason)
+            return None
+
+        self._failed_at.pop(url, None)
+        self._cache[url] = photo
+        if len(self._cache) > PHOTO_CACHE_SIZE:
+            self._cache.popitem(last=False)  # 가장 오래 안 쓴 사진부터 버립니다
+        if not self._confirmed:
+            self._confirmed = True
+            log.info(
+                "🖼️ 수형 사진 직접 첨부 동작 확인: %s (%.1fKB · %.2f초)",
+                url, len(photo.data) / 1024, time.monotonic() - started,
+            )
+        return photo
+
+    async def _download(self, url: str) -> Photo:
+        session = self._ensure_session()
+        timeout = aiohttp.ClientTimeout(total=PHOTO_FETCH_TIMEOUT)
+        async with session.get(url, timeout=timeout) as resp:
+            if resp.status != 200:
+                raise PhotoError(f"HTTP {resp.status}")
+            if resp.content_length is not None and resp.content_length > PHOTO_MAX_BYTES:
+                raise PhotoError(f"파일이 너무 큼 ({resp.content_length:,}바이트)")
+            chunks: list[bytes] = []
+            size = 0
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                size += len(chunk)
+                if size > PHOTO_MAX_BYTES:
+                    raise PhotoError(f"파일이 너무 큼 ({PHOTO_MAX_BYTES:,}바이트 초과)")
+                chunks.append(chunk)
+            content_type = resp.headers.get("Content-Type", "?")
+
+        data = b"".join(chunks)
+        extension = sniff_image(data)
+        if extension is None:
+            raise PhotoError(f"사진 파일이 아님 (Content-Type: {content_type} · {len(data)}바이트)")
+        return Photo(data, f"{PHOTO_FILENAME}.{extension}")
 
 
 # ── 링크 버튼 ───────────────────────────────────────────────────
@@ -156,11 +303,17 @@ async def send_with_media_fallback(
     *,
     embed: discord.Embed,
     view: discord.ui.View | None = None,
+    photo: Photo | None = None,
     **kwargs: Any,
 ) -> T:
     """
     send(embed=..., view=..., **kwargs) 를 부르고, 디스코드가 400 으로 거절하면
     미디어를 빼고 딱 한 번 더 보냅니다. 두 번째도 실패하면 그 오류를 그대로 올립니다.
+
+    photo 는 PhotoFetcher.attach() 가 돌려준 사진입니다. 첨부 파일(file=)로 함께 보내고,
+    다시 보낼 때는 사진을 뺐으므로 첨부하지 않습니다.
+    수정(edit)에는 photo 를 넘기지 마세요. 처음 보낼 때 올린 첨부 파일은 수정해도 그대로 남고,
+    임베드의 attachment:// 주소도 그 파일을 계속 가리킵니다.
 
     send 로는 followup.send · response.edit_message · message.edit 를 넘깁니다.
     (응답이 거절되면 그 상호작용은 아직 응답 전이라 같은 함수로 다시 보낼 수 있습니다)
@@ -172,8 +325,9 @@ async def send_with_media_fallback(
     def view_kwargs() -> dict[str, Any]:
         return {"view": view} if view is not None and view.children else {}
 
+    file_kwargs = {"file": photo.to_file()} if photo is not None else {}
     try:
-        return await send(embed=embed, **view_kwargs(), **kwargs)
+        return await send(embed=embed, **view_kwargs(), **file_kwargs, **kwargs)
     except discord.HTTPException as error:
         if error.status != 400 or not has_media(embed, view):
             raise
