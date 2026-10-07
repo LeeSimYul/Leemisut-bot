@@ -1,6 +1,6 @@
 """
 utils/paginator.py
-조교 이미숫 - 버튼으로 페이지를 넘기는 공용 뷰 (/수어검색, /수어목록 에서 사용)
+조교 이미숫 - 버튼으로 페이지를 넘기는 공용 뷰 (/수어검색 · /수어목록 · /수어단어장 · /오답노트)
 
     [◀ 이전]  [1 / N 페이지]  [▶ 다음]
 
@@ -8,6 +8,8 @@ utils/paginator.py
   단어 3,000개짜리 목록도 전부 미리 불러오지 않고, 한 번 만든 페이지는 기억해 둡니다.
 ■ 명령어를 실행한 사람만 버튼을 누를 수 있습니다.
 ■ 마지막 조작 후 60초가 지나면 버튼이 모두 잠깁니다. (disabled=True)
+■ 페이지마다 달라지는 컴포넌트(예: /오답노트 '자세히 보기' 메뉴)는 하위 클래스에서
+  on_page_change() 를 덮어써서 맞춥니다. 한 페이지뿐이면 이동 버튼만 빼고 그 컴포넌트는 남깁니다.
 
 ⚠️ cogs 끼리 서로 import 하면 확장(extension) 모듈이 두 번 만들어지므로
    여러 Cog 가 함께 쓰는 컴포넌트는 utils 에 둡니다.
@@ -70,13 +72,17 @@ class SignPaginatorView(discord.ui.View):
     async def start(self, interaction: discord.Interaction, *, ephemeral: bool = False) -> None:
         """
         첫 페이지를 보냅니다. 명령어에서 interaction.response.defer() 를 한 뒤에 호출해 주세요.
-        한 페이지로 끝나면 버튼 없이 보냅니다.
+        한 페이지로 끝나면 이동 버튼 없이 보냅니다. (남는 컴포넌트가 없으면 뷰 없이)
         """
         embed = await self._get_page(0)
+        self.on_page_change()
         if self.total_pages == 1:
-            self.stop()
-            await interaction.followup.send(embed=embed, ephemeral=ephemeral)
-            return
+            for button in (self.prev_button, self.page_indicator, self.next_button):
+                self.remove_item(button)
+            if not self.children:
+                self.stop()
+                await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+                return
         # wait=True 를 줘야 메시지 객체가 돌아옵니다 (시간 초과 시 버튼 잠금에 필요)
         self.message = await interaction.followup.send(
             embed=embed, view=self, ephemeral=ephemeral, wait=True
@@ -103,6 +109,12 @@ class SignPaginatorView(discord.ui.View):
         await self._move(interaction, +1)
 
     # ── 내부 처리 ───────────────────────────────────────────────
+    def on_page_change(self) -> None:
+        """
+        첫 페이지를 보내기 직전과 페이지를 넘길 때마다 불립니다. (기본은 아무것도 하지 않음)
+        페이지마다 달라지는 컴포넌트가 있으면 하위 클래스에서 self.page 를 보고 맞춰 주세요.
+        """
+
     def _sync_buttons(self) -> None:
         """현재 페이지에 맞게 버튼 상태와 가운데 표시를 맞춥니다."""
         self.prev_button.disabled = self.page <= 0
@@ -122,6 +134,7 @@ class SignPaginatorView(discord.ui.View):
             self.page = max(0, min(self.page + step, self.total_pages - 1))
             embed = await self._get_page(self.page)
             self._sync_buttons()
+            self.on_page_change()
             self._last_interaction = interaction
             # 버튼 상호작용의 원본 응답 = 버튼이 달린 메시지 (ephemeral 메시지도 수정 가능)
             await interaction.edit_original_response(embed=embed, view=self)
@@ -138,10 +151,10 @@ class SignPaginatorView(discord.ui.View):
         return False
 
     async def on_timeout(self) -> None:
-        """마지막 조작 후 60초가 지나면 버튼을 모두 잠급니다."""
+        """마지막 조작 후 timeout(기본 60초)이 지나면 버튼 · 메뉴를 모두 잠급니다."""
         async with self._lock:
             for item in self.children:
-                if isinstance(item, discord.ui.Button):
+                if isinstance(item, (discord.ui.Button, discord.ui.Select)):
                     item.disabled = True
             try:
                 if self._last_interaction is not None:

@@ -62,6 +62,11 @@ class ImisutBot(commands.Bot):
         await self.db.connect()
         # 클라우드(PostgreSQL)인지 로컬 파일(SQLite)인지 콘솔에서 바로 알 수 있게 남깁니다.
         log.info("🗄️ DB 연결 완료: %s", self.db.describe())
+        # 임베드에 띄울 수형 사진이 실제로 저장돼 있는지 확인합니다. (0개면 /수어전체동기화 를 다시)
+        log.info(
+            "🖼️ 수형 사진이 있는 단어: %d / %d개",
+            await self.db.count_words_with_image(), await self.db.count_words(),
+        )
         await self.load_cogs()
         await self.sync_commands()
 

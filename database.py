@@ -964,6 +964,13 @@ class Database:
 
         return await self._cached("count_distinct_words", load)
 
+    async def count_words_with_image(self) -> int:
+        """수형 사진 주소(image_url)가 저장된 단어 수. (봇 시작 로그에서 사진 수집 상태 확인용)"""
+        row = await self.backend.fetch_one(
+            "SELECT COUNT(*) AS cnt FROM sign_words WHERE image_url <> ''"
+        )
+        return int(row["cnt"]) if row else 0
+
     async def get_daily_word(self, day: date) -> Row | None:
         """날짜를 기준으로 단어를 골라, 같은 날에는 모두에게 같은 단어를 보여줍니다."""
         count = await self.count_words()

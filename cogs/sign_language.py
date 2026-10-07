@@ -7,9 +7,18 @@ cogs/sign_language.py
 ■ /오늘의수어 는 유저마다 다른 단어를 배정하고, 하루 한 번 출석 보상을 줍니다.
 ■ 링크 표기 원칙
    - 메시지 본문(content)에는 주소를 넣지 않습니다. 긴 URL이 그대로 보이기 때문입니다.
-   - 영상·사전 링크는 임베드 안에서 마스크 링크([보이는 글](주소))로만 보여 줍니다.
+   - 영상·사전 링크는 임베드 안의 마스크 링크([보이는 글](주소))와, 메시지 아래의
+     링크 버튼(🎬 수어 영상 보기 · 📖 국립국어원 사전) 두 곳에 함께 붙입니다.
+     버튼은 모바일에서 누르기 쉽고, 글 링크는 버튼이 빠지는 상황(아래 400 대비)에도 남습니다.
+■ 미디어 (utils/media.py)
+   - 수형 사진은 임베드 본문 아래 이미지(set_image)로 띄웁니다. 원본이 215×161 이라
+     오른쪽 위 썸네일(80×80)로 줄이면 모바일에서 손 모양이 보이지 않습니다.
+   - 국립국어원 주소는 내보낼 때만 https 로 바꾸고, DB 에 저장된 원본은 그대로 둡니다.
+   - 사진이 없거나 주소가 이상하면 사진 없이 설명 · 링크만 보여 줍니다.
+     디스코드가 그래도 400 으로 거절하면 사진 · 링크 버튼만 빼고 한 번 더 보냅니다.
 ■ 정답 은닉 원칙
    사전 상세 페이지는 주소를 누르면 단어명이 보이므로 퀴즈가 끝난 뒤에만 붙입니다.
+   (영상 파일 주소에는 단어명이 없어서 문제를 내는 동안에도 영상 버튼은 보여 줍니다)
 ■ 모든 슬래시 명령어는 시작 직후 safe_defer() 로 응답을 미룹니다.
    3초 타임아웃(10062)을 막고, 이미 응답된 상호작용이면 이중 응답 없이 조용히 끝냅니다.
    (같은 토큰으로 여러 PC·프로세스를 켜 두면 하나의 상호작용을 여러 봇이 함께 받습니다)
@@ -17,6 +26,7 @@ cogs/sign_language.py
    (공용 컴포넌트: utils/paginator.py)
 ■ 오답노트: /수어퀴즈 · /복습퀴즈 에서 틀린 단어(시간 초과 포함)는 user_quiz_notes 에 자동으로
    쌓입니다. /오답노트 로 많이 틀린 순서대로 보고, /복습퀴즈 로 맞히면 해결(마스터)됩니다.
+   /오답노트 의 '자세히 보기' 메뉴로 단어를 고르면 사진 · 설명 · 링크 카드가 나에게만 열립니다.
    /수어퀴즈 정답은 오답노트를 바꾸지 않습니다. (해결은 /복습퀴즈 로만)
 ■ /수어퀴즈 는 30% 확률로 오답노트의 미해결 단어를 정답으로 내는 복습 문제를 냅니다.
    풀이 결과(정답 · 오답 · 시간 초과)는 모두 quiz_logs 에 기록됩니다.
@@ -33,14 +43,21 @@ import random
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from urllib.parse import urlsplit
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from database import QUIZ_TYPE_REVIEW, Database, Row
-from utils.paginator import SignPaginatorView, page_count
+from utils.media import (
+    is_video_url,
+    link_buttons,
+    link_view,
+    pick_image,
+    secure_url,
+    send_with_media_fallback,
+)
+from utils.paginator import PageRenderer, SignPaginatorView, page_count
 from utils.rewards import (
     DAILY_EXP,
     DAILY_POINTS,
@@ -86,9 +103,6 @@ COOLDOWN_MESSAGE = f"조교가 조금 바빠요! {COOLDOWN_SECONDS:g}초 후에 
 # True로 바꾸면 본문에 영상 주소를 넣어 디스코드 플레이어가 뜹니다.
 # 대신 긴 주소가 글로 보입니다. (기본값 False = 깔끔한 마스크 링크만)
 SHOW_VIDEO_PLAYER = False
-
-IMAGE_EXTENSIONS = (".gif", ".png", ".jpg", ".jpeg", ".webp")
-VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov")
 
 EMBED_FIELD_LIMIT = 1024  # 디스코드 임베드 필드 한 칸의 최대 길이
 MAX_FIELD_CHUNKS = 4      # 임베드 전체 6000자 제한을 넘지 않도록 한 설명의 최대 칸 수
@@ -156,26 +170,25 @@ def _row_get(row: Row, key: str, default: str = "") -> str:
     return value if value else default
 
 
-def _is_http(url: str) -> bool:
-    return bool(url) and url.startswith(("http://", "https://"))
-
-
-def is_image_url(url: str) -> bool:
-    return _is_http(url) and urlsplit(url).path.lower().endswith(IMAGE_EXTENSIONS)
-
-
-def is_video_url(url: str) -> bool:
-    return _is_http(url) and urlsplit(url).path.lower().endswith(VIDEO_EXTENSIONS)
+def word_image(word: Row) -> str:
+    """임베드에 띄울 수형 사진 주소. (https 로 다듬은 값, 없으면 빈 문자열)"""
+    return pick_image(_row_get(word, "image_url"), word["video_url"])
 
 
 def has_quiz_media(word: Row) -> bool:
     """퀴즈 문제로 보여 줄 수형 사진이나 영상이 있는지 확인합니다."""
-    return is_image_url(_row_get(word, "image_url")) or is_video_url(word["video_url"])
+    return bool(word_image(word)) or is_video_url(word["video_url"])
+
+
+def word_link_view(word: Row) -> discord.ui.View | None:
+    """단어 카드 아래에 붙일 '🎬 수어 영상 보기' · '📖 국립국어원 사전' 버튼. (없으면 None)"""
+    return link_view(video_url=word["video_url"], detail_url=_row_get(word, "detail_url"))
 
 
 def masked(label: str, url: str) -> str:
-    """디스코드 마스크 링크. 주소가 비어 있으면 빈 문자열을 돌려줍니다."""
-    return f"[{label}]({url})" if _is_http(url) else ""
+    """디스코드 마스크 링크. 쓸 수 없는 주소면 빈 문자열을 돌려줍니다."""
+    url = secure_url(url)
+    return f"[{label}]({url})" if url else ""
 
 
 def summarize(meaning: str, limit: int = 45) -> str:
@@ -216,18 +229,17 @@ def add_full_text_field(embed: discord.Embed, name: str, text: str) -> None:
         embed.add_field(name=name if index == 0 else f"{name} (이어서)", value=chunk, inline=False)
 
 
-def set_media(embed: discord.Embed, image_url: str, video_url: str) -> str | None:
+def set_media(embed: discord.Embed, word: Row) -> str | None:
     """
-    임베드에 보여 줄 미디어를 정합니다.
+    수형 사진을 임베드 본문 아래 이미지로 띄웁니다. 사진이 없으면 건너뜁니다. (설명 · 링크만 남음)
     반환값은 메시지 본문에 넣을 내용입니다. (기본 설정에서는 항상 None)
     """
-    if is_image_url(image_url):
-        embed.set_image(url=image_url)
-    elif is_image_url(video_url):  # 영상 자리에 gif가 들어온 경우
-        embed.set_image(url=video_url)
+    image = word_image(word)  # 영상 자리에 gif 가 들어온 단어도 여기서 골라집니다
+    if image:
+        embed.set_image(url=image)
 
-    if SHOW_VIDEO_PLAYER and is_video_url(video_url):
-        return video_url
+    if SHOW_VIDEO_PLAYER and is_video_url(word["video_url"]):
+        return secure_url(word["video_url"])
     return None
 
 
@@ -246,7 +258,7 @@ def build_word_embed(
     단어 하나를 자세히 보여 주는 임베드를 만듭니다. (/오늘의수어, /수어검색 공용)
     반환: (임베드, 메시지 본문에 넣을 내용)
     """
-    detail_url = _row_get(word, "detail_url")
+    detail_url = secure_url(_row_get(word, "detail_url"))
     embed = discord.Embed(title=title, url=detail_url or None, color=color)
     add_full_text_field(embed, "✋ 수어 설명", word["meaning"])
 
@@ -254,7 +266,7 @@ def build_word_embed(
     if links:
         embed.add_field(name="🔗 바로가기", value=links, inline=False)
 
-    content = set_media(embed, _row_get(word, "image_url"), word["video_url"])
+    content = set_media(embed, word)
     return embed, content
 
 
@@ -331,6 +343,19 @@ def build_notes_page_embed(
     return embed
 
 
+def build_note_detail_embed(word: Row) -> tuple[discord.Embed, str | None]:
+    """/오답노트 '자세히 보기'로 연 단어 카드. (수형 사진 · 설명 · 링크 + 오답 기록)"""
+    embed, content = build_word_embed(
+        word, title=f"📒 오답노트 : {word['word_name']} [{word['category']}]", color=COLOR_NOTES
+    )
+    embed.description = (
+        f"❌ 오답 **{word['wrong_count']}**회 · "
+        f"🗓️ 마지막으로 틀린 날 {format_kst_date(word['last_wrong_at'])}"
+    )
+    embed.set_footer(text="/복습퀴즈 에서 맞히면 오답노트에서 해결돼요 🤟")
+    return embed, content
+
+
 def build_quiz_embed(
     answer: Row, *, title: str, intro: str, footer: str
 ) -> tuple[discord.Embed, str | None]:
@@ -347,9 +372,9 @@ def build_quiz_embed(
         ),
         color=COLOR_QUIZ,
     )
-    content = set_media(embed, _row_get(answer, "image_url"), answer["video_url"])
+    content = set_media(embed, answer)
 
-    # 영상 링크는 마스크 링크로만 (주소에 단어가 드러나지 않습니다)
+    # 영상 링크는 마스크 링크 · 링크 버튼으로만 (주소에 단어가 드러나지 않습니다)
     video_link = masked("🎬 영상으로 문제 보기", answer["video_url"])
     if video_link:
         embed.add_field(name="문제 영상", value=video_link, inline=False)
@@ -387,7 +412,7 @@ def notes_notice(outcome: QuizOutcome) -> str:
 # ── 퀴즈 UI ─────────────────────────────────────────────────────
 class QuizChoiceButton(discord.ui.Button["SignQuizView"]):
     def __init__(self, word_id: int, label: str) -> None:
-        super().__init__(label=label, style=discord.ButtonStyle.secondary)
+        super().__init__(label=label, style=discord.ButtonStyle.secondary, row=0)
         self.word_id = word_id
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -420,10 +445,13 @@ class SignQuizView(discord.ui.View):
         self.message: discord.Message | discord.WebhookMessage | None = None
         self.answered = False
         # 정답이 드러나는 주소는 여기에만 보관하고, 끝난 뒤에 꺼냅니다.
-        self.detail_url = _row_get(answer, "detail_url")
+        self.detail_url = secure_url(_row_get(answer, "detail_url"))
 
         for word in choices:
             self.add_item(QuizChoiceButton(word["word_id"], word["word_name"]))
+        # 보기 아래 줄에 영상 버튼. (사전 버튼은 정답 공개 뒤 _finish_embed 에서 붙입니다)
+        for button in link_buttons(video_url=answer["video_url"], row=1):
+            self.add_item(button)
 
     def _reveal(self, chosen: QuizChoiceButton | None = None) -> None:
         """버튼을 모두 잠그고 정답(초록)/내가 고른 오답(빨강)을 표시합니다."""
@@ -474,7 +502,9 @@ class SignQuizView(discord.ui.View):
         # 만료(10062)되었거나 다른 프로세스가 먼저 응답했어도 채점·보상은 이미 DB에 반영된 뒤라,
         # 오류 화면을 띄우지 않고 조용히 넘어갑니다.
         try:
-            await interaction.response.edit_message(embed=self.embed, view=self)
+            await send_with_media_fallback(
+                interaction.response.edit_message, embed=self.embed, view=self
+            )
         except (discord.NotFound, discord.InteractionResponded):
             log.debug("채점 화면을 갱신하지 못했습니다. (만료되었거나 이미 응답됨)")
 
@@ -491,7 +521,7 @@ class SignQuizView(discord.ui.View):
 
         if self.message is not None:
             try:
-                await self.message.edit(embed=self.embed, view=self)
+                await send_with_media_fallback(self.message.edit, embed=self.embed, view=self)
             except discord.HTTPException:
                 pass  # 메시지가 삭제된 경우 등
 
@@ -565,15 +595,17 @@ class SignQuizView(discord.ui.View):
         )
 
     def _finish_embed(self) -> None:
-        """정답 공개 후에만 설명 전문과 링크를 붙입니다."""
+        """정답 공개 후에만 설명 전문과 사전 링크(제목 · 글 링크 · 버튼)를 붙입니다."""
         self.embed.clear_fields()
         # 제목을 누르면 사전 상세 페이지로 이동합니다. (정답 공개 후이므로 안전)
-        if _is_http(self.detail_url):
+        if self.detail_url:
             self.embed.url = self.detail_url
         add_full_text_field(self.embed, "✋ 수어 설명", self.answer["meaning"])
         links = link_field_value(self.answer, include_detail=True)
         if links:
             self.embed.add_field(name="🔗 바로가기", value=links, inline=False)
+        for button in link_buttons(detail_url=self.detail_url, row=1):
+            self.add_item(button)
         self.embed.set_footer(text=self.finish_footer)
 
     async def on_error(
@@ -672,6 +704,70 @@ class ReviewQuizView(SignQuizView):
         )
 
 
+# ── 오답노트 UI ─────────────────────────────────────────────────
+class NoteDetailSelect(discord.ui.Select["NotesPaginatorView"]):
+    """지금 페이지의 단어 중 하나를 골라 상세 카드를 엽니다. (선택지는 페이지마다 바뀝니다)"""
+
+    def __init__(self) -> None:
+        super().__init__(placeholder="🔍 자세히 볼 단어를 골라 주세요", row=1)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        assert self.view is not None
+        await self.view.show_detail(interaction, int(self.values[0]))
+
+
+class NotesPaginatorView(SignPaginatorView):
+    """
+    /오답노트 목록. 페이지 버튼 아래 '자세히 보기' 메뉴로 단어 카드를 엽니다.
+    카드는 고른 사람에게만 새 메시지로 열리고(ephemeral), 목록은 그대로 남습니다.
+    메뉴도 페이지 버튼과 함께 마지막 조작 NOTES_PAGINATOR_TIMEOUT(180초) 뒤 잠깁니다.
+    """
+
+    def __init__(
+        self, owner: discord.abc.User, words: list[Row], render_page: PageRenderer
+    ) -> None:
+        super().__init__(
+            owner,
+            page_count(len(words), NOTES_PAGE_SIZE),
+            render_page,
+            timeout=NOTES_PAGINATOR_TIMEOUT,
+        )
+        self.words = words
+        self.detail_select = NoteDetailSelect()
+        self.add_item(self.detail_select)
+
+    def on_page_change(self) -> None:
+        """메뉴의 선택지를 지금 페이지의 단어로 바꿉니다. (값은 전체 목록에서의 위치)"""
+        offset = self.page * NOTES_PAGE_SIZE
+        self.detail_select.options = [
+            discord.SelectOption(
+                label=f"{index + 1}. {w['word_name']} [{w['category']}]"[:100],
+                description=(
+                    f"❌ {w['wrong_count']}회 · 🗓️ {format_kst_date(w['last_wrong_at'])}"
+                )[:100],
+                value=str(index),
+            )
+            for index, w in enumerate(
+                self.words[offset: offset + NOTES_PAGE_SIZE], start=offset
+            )
+        ]
+
+    async def show_detail(self, interaction: discord.Interaction, index: int) -> None:
+        # 페이지 이동처럼 먼저 응답을 미루고, 메뉴를 처음 상태로 되돌려
+        # 같은 단어를 다시 골라도 카드가 열리게 합니다.
+        await interaction.response.defer()
+        async with self._lock:
+            self._last_interaction = interaction  # 시간 초과 잠금에 가장 최근 토큰을 씁니다
+            await interaction.edit_original_response(view=self)
+
+        word = self.words[index]
+        embed, content = build_note_detail_embed(word)
+        await send_with_media_fallback(
+            interaction.followup.send,
+            embed=embed, view=word_link_view(word), content=content, ephemeral=True,
+        )
+
+
 # ── Cog ─────────────────────────────────────────────────────────
 class SignLanguage(commands.Cog, name="수어"):
     def __init__(self, bot: commands.Bot, db: Database) -> None:
@@ -725,7 +821,9 @@ class SignLanguage(commands.Cog, name="수어"):
         embed.set_footer(
             text=f"{today:%Y년 %m월 %d일} · {interaction.user.display_name} 님의 오늘 단어예요 🤟"
         )
-        await interaction.followup.send(content=content, embed=embed)
+        await send_with_media_fallback(
+            interaction.followup.send, embed=embed, view=word_link_view(word), content=content
+        )
 
     # ── /수어검색 ────────────────────────────────────────────────
     @app_commands.command(
@@ -781,7 +879,9 @@ class SignLanguage(commands.Cog, name="수어"):
             )
             embed.description = f"{conditions} 으로 찾은 결과예요."
             embed.set_footer(text="다른 단어도 찾아볼까요? /수어검색 🤟")
-            await interaction.followup.send(content=content, embed=embed)
+            await send_with_media_fallback(
+                interaction.followup.send, embed=embed, view=word_link_view(word), content=content
+            )
             return
 
         # 여러 개면 SEARCH_PAGE_SIZE 개씩 나눠 버튼(◀ 이전 · 1 / N · ▶ 다음)으로 넘겨 봅니다.
@@ -891,8 +991,10 @@ class SignLanguage(commands.Cog, name="수어"):
         #   - 버튼 클릭: interaction.response.edit_message() 가 같은 비공개 메시지를 고침
         #   - 시간 초과: 여기서 받은 WebhookMessage.edit() 가 상호작용 토큰으로 같은 메시지를 고침
         #     (토큰 유효 15분 > QUIZ_TIMEOUT 45초라 안전)
-        view.message = await interaction.followup.send(
-            content=content, embed=embed, view=view, ephemeral=True, wait=True
+        # 디스코드가 사진 · 영상 버튼 때문에 거절(400)하면 그것만 빼고 보기 버튼은 둔 채 다시 보냅니다.
+        view.message = await send_with_media_fallback(
+            interaction.followup.send,
+            embed=embed, view=view, content=content, ephemeral=True, wait=True,
         )
 
     async def _pick_review_answer(self, user_id: int) -> Row | None:
@@ -950,13 +1052,8 @@ class SignLanguage(commands.Cog, name="수어"):
                 owner_name=owner_name, total=len(words), mastered=mastered, offset=offset,
             )
 
-        # 마지막 조작 후 NOTES_PAGINATOR_TIMEOUT(180초)가 지나면 버튼이 모두 잠깁니다.
-        view = SignPaginatorView(
-            interaction.user,
-            page_count(len(words), NOTES_PAGE_SIZE),
-            render_page,
-            timeout=NOTES_PAGINATOR_TIMEOUT,
-        )
+        # 마지막 조작 후 NOTES_PAGINATOR_TIMEOUT(180초)가 지나면 버튼 · 메뉴가 모두 잠깁니다.
+        view = NotesPaginatorView(interaction.user, words, render_page)
         await view.start(interaction, ephemeral=True)
 
     # ── /복습퀴즈 ────────────────────────────────────────────────
@@ -1016,8 +1113,9 @@ class SignLanguage(commands.Cog, name="수어"):
 
         view = ReviewQuizView(self.db, interaction.user, answer, choices, embed)
         # /수어퀴즈 와 같은 이유로 ephemeral + wait=True (시간 초과 때 같은 비공개 메시지를 고침)
-        view.message = await interaction.followup.send(
-            content=content, embed=embed, view=view, ephemeral=True, wait=True
+        view.message = await send_with_media_fallback(
+            interaction.followup.send,
+            embed=embed, view=view, content=content, ephemeral=True, wait=True,
         )
 
     # ── /단어장저장 ──────────────────────────────────────────────
