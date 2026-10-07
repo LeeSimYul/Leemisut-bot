@@ -999,6 +999,18 @@ class Database:
             "SELECT * FROM sign_words ORDER BY word_id LIMIT 1 OFFSET ?", (offset,)
         )
 
+    async def get_recent_daily_user_ids(self, since: date, limit: int = 500) -> list[int]:
+        """
+        since(포함) 이후에 /오늘의수어 를 확인한 유저 ID. 최근에 확인한 순서.
+        (오늘의 수어 사진을 미리 받아 둘 대상 - 단어가 유저마다 달라서 유저 기준으로 고릅니다)
+        """
+        rows = await self.backend.fetch_all(
+            "SELECT user_id FROM users WHERE last_daily_date >= ?::text "
+            "ORDER BY last_daily_date DESC, user_id LIMIT ?",
+            (since.isoformat(), limit),
+        )
+        return [int(row["user_id"]) for row in rows]
+
     async def get_all_categories(self) -> list[tuple[str, int]]:
         """
         DB에 실제로 등록된 분류 목록을 (분류명, 단어 수) 로 돌려줍니다. (캐시)

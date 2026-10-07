@@ -15,7 +15,10 @@ cogs/sign_language.py
      오른쪽 위 썸네일(80×80)로 줄이면 모바일에서 손 모양이 보이지 않습니다.
    - 사진은 봇이 직접 받아 첨부 파일(attachment://sign.jpg)로 올립니다. (PhotoFetcher)
      디스코드 프록시가 국립국어원 서버에서 사진을 받아 오지 못해도 보이게 하려는 것입니다.
-     봇도 받지 못하면 원본(http) 주소를 그대로 넘겨 디스코드가 직접 시도하게 둡니다.
+     받은 사진은 디스크(data/cache/images/)에 영구 보관해, 두 번째부터는 국립국어원을 거치지 않습니다.
+     끝내 받지 못하면 사진 칸을 비우고 '📷 사진' 안내 칸을 붙입니다.
+   - 매일 자정(KST)과 봇이 켜질 때, 최근 PREFETCH_ACTIVE_DAYS 일 안에 /오늘의수어 를 쓴 유저들의
+     오늘 단어 사진을 미리 받아 둡니다. (단어가 유저마다 달라서 유저 기준으로 고릅니다)
    - 국립국어원 링크(버튼 · 제목 · 글 링크)는 내보낼 때만 https 로 바꾸고, DB 원본은 그대로 둡니다.
    - 사진이 없거나 주소가 이상하면 사진 없이 설명 · 링크만 보여 줍니다.
      디스코드가 그래도 400 으로 거절하면 사진 · 링크 버튼만 빼고 한 번 더 보냅니다.
@@ -44,12 +47,14 @@ import contextlib
 import logging
 import random
 import re
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from datetime import time as dtime
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from database import QUIZ_TYPE_REVIEW, Database, Row
 from utils.media import (
@@ -84,6 +89,11 @@ SEARCH_PAGE_SIZE = 5    # /수어검색 결과 목록 한 페이지에 보여 �
 BOOKMARK_PAGE_SIZE = 5  # /수어단어장 한 페이지에 보여 줄 건수
 NOTES_PAGE_SIZE = 5     # /오답노트 한 페이지에 보여 줄 건수
 NOTES_PAGINATOR_TIMEOUT = 180.0  # 초 - /오답노트 페이지 버튼이 잠기기까지 (마지막 조작 기준)
+
+# /오늘의수어 사진 미리 받기: 자정 직후(날짜가 확실히 바뀐 뒤)와 봇이 켜질 때
+PREFETCH_TIME = dtime(hour=0, minute=0, second=30, tzinfo=KST)
+PREFETCH_ACTIVE_DAYS = 14   # 최근 이 기간에 /오늘의수어 를 쓴 유저의 오늘 단어를 미리 받습니다
+PREFETCH_MAX_USERS = 500    # 한 번에 미리 받을 최대 유저 수
 
 # 오답 복습: /수어퀴즈 에서 이 확률로 오답노트의 미해결 단어를 정답으로 냅니다.
 REVIEW_PROBABILITY = 0.3
@@ -787,8 +797,53 @@ class SignLanguage(commands.Cog, name="수어"):
         # 수형 사진을 봇이 직접 받아 첨부합니다. (명령어마다 defer 한 뒤에 부름)
         self.photos = PhotoFetcher()
 
+    async def cog_load(self) -> None:
+        self.prefetch_daily_photos.start()
+
     async def cog_unload(self) -> None:
+        self.prefetch_daily_photos.cancel()
         await self.photos.close()
+
+    # ── 오늘의 수어 사진 미리 받기 ──────────────────────────────
+    @tasks.loop(time=PREFETCH_TIME)
+    async def prefetch_daily_photos(self) -> None:
+        await self._prefetch_daily_photos()
+
+    @prefetch_daily_photos.before_loop
+    async def _prefetch_on_boot(self) -> None:
+        await self.bot.wait_until_ready()
+        await self._prefetch_daily_photos()  # 봇이 켜질 때 한 번 (그 뒤로는 매일 자정)
+
+    async def _prefetch_daily_photos(self) -> None:
+        """
+        최근에 /오늘의수어 를 쓴 유저들의 오늘 단어 사진을 디스크에 미리 받아 둡니다.
+        실패해도 봇 동작에는 영향이 없습니다. (그 유저가 명령어를 쓸 때 다시 시도)
+        """
+        try:
+            today = today_kst()
+            user_ids = await self.db.get_recent_daily_user_ids(
+                today - timedelta(days=PREFETCH_ACTIVE_DAYS), limit=PREFETCH_MAX_USERS
+            )
+            urls: list[str] = []
+            for user_id in user_ids:
+                word = await self.db.get_daily_word_for_user(user_id, today)
+                image = word_image(word) if word is not None else ""
+                if image:
+                    urls.append(image)
+            if not urls:
+                log.info("🖼️ 오늘의 수어 사진 미리 받기 (%s): 받을 사진 없음 (최근 유저 %d명)", today, len(user_ids))
+                return
+
+            started = time.monotonic()
+            stats = await self.photos.prefetch(urls)
+            log.info(
+                "🖼️ 오늘의 수어 사진 미리 받기 (%s): 유저 %d명 · 사진 %d장 → "
+                "이미 있음 %d · 새로 받음 %d · 실패 %d (%.1f초)",
+                today, len(user_ids), len(set(urls)),
+                stats["cached"], stats["fetched"], stats["failed"], time.monotonic() - started,
+            )
+        except Exception:
+            log.exception("오늘의 수어 사진 미리 받기 중 오류 (봇 동작에는 영향 없음)")
 
     # ── /오늘의수어 ──────────────────────────────────────────────
     @app_commands.command(

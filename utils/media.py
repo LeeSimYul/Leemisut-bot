@@ -11,27 +11,32 @@ utils/media.py
   주소만 넘기면(set_image(url=...)) 디스코드 미디어 프록시가 국립국어원 서버에서 사진을 받아 와야 하는데,
   운영 서버에서 http · https 어느 쪽으로도 사진이 나타나지 않았습니다(2026-10-07).
   그래서 봇이 사진을 받아 attachment://sign.jpg 로 함께 올립니다.
-  받지 못하면(2초 초과 · 404 · 사진이 아닌 응답) 원본 주소(http)를 그대로 넘겨 디스코드가 직접 시도하게 둡니다.
-  디스코드도 못 받으면 사진 칸 없이 설명 · 링크만 보입니다.
+  국립국어원 서버가 매우 느려서(2초 안에 못 받음 · 2026-10-07) 받은 사진은 디스크에 영구 보관합니다.
+    1) 메모리 → 2) 디스크(data/cache/images/) → 3) 국립국어원 (한 번에 5초 · 1회 재시도)
+  끝내 받지 못하면 사진 칸을 비우고 '사진을 불러오지 못했다'는 안내를 붙입니다.
+  (디스코드 프록시도 같은 서버에서 못 받으므로 주소를 넘겨 봐야 빈칸만 남습니다)
 ■ 디스코드가 거절할 주소는 미리 걸러 냅니다 (빈 문자열 → 사진 · 버튼을 건너뛰고 글과 링크만)
   - http(s) 가 아니거나 호스트가 없는 주소, 공백 · 제어 문자가 섞인 주소
   - 임베드 주소 EMBED_URL_LIMIT(2,048자) · 링크 버튼 주소 BUTTON_URL_LIMIT(512자) 초과
 ■ 그래도 디스코드가 400 으로 거절하면 사진 · 제목 링크 · 링크 버튼을 빼고 한 번 더 보냅니다.
   (send_with_media_fallback) 퀴즈 보기 버튼처럼 링크가 아닌 버튼은 그대로 둡니다.
 ■ 주소 다듬기(secure_url 등)는 글자만 보고 네트워크 요청은 보내지 않습니다.
-  네트워크를 쓰는 것은 PhotoFetcher 뿐이고, 명령어가 응답을 미룬(defer) 뒤에만 불리므로
-  3초 응답 제한에 걸리지 않습니다. (한 장에 최대 PHOTO_FETCH_TIMEOUT 초)
+  네트워크 · 디스크를 쓰는 것은 PhotoFetcher 뿐이고, 명령어가 응답을 미룬(defer) 뒤에만 불리므로
+  3초 응답 제한에 걸리지 않습니다. 디스크 읽기 · 쓰기는 별도 스레드에서 해서 이벤트 루프를 막지 않습니다.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import logging
+import os
 import re
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
@@ -55,10 +60,19 @@ HTTPS_UPGRADE_DOMAINS = ("korean.go.kr",)
 _UNSAFE_CHARS = re.compile(r'[\s\x00-\x1f\x7f<>"]')
 
 # ── 사진 직접 받기 (PhotoFetcher) ──
-PHOTO_FETCH_TIMEOUT = 2.0        # 초 - 한 장을 받는 데 기다리는 최대 시간
+PHOTO_FETCH_TIMEOUT = 5.0        # 초 - 한 번 받는 데 기다리는 최대 시간 (명령어는 defer 뒤라 여유가 있음)
+PHOTO_FETCH_ATTEMPTS = 2         # 시간 초과 · 연결 끊김 · 5xx 일 때 한 번 더 시도
+PHOTO_RETRY_BACKOFF = 0.5        # 초 - 다시 시도하기 전 잠깐 쉬는 시간
+PHOTO_PREFETCH_TIMEOUT = 20.0    # 초 - 미리 받기(기다리는 사람이 없음)는 한 번에 더 오래 기다립니다
 PHOTO_MAX_BYTES = 2 * 1024 * 1024  # 이보다 큰 파일은 받지 않습니다 (수형 사진은 10~30KB)
-PHOTO_CACHE_SIZE = 512           # 메모리에 보관할 사진 수 (최대 수십 MB 이내)
-PHOTO_RETRY_AFTER = 600.0        # 초 - 받지 못한 주소는 이 시간 동안 다시 시도하지 않습니다
+PHOTO_CACHE_SIZE = 512           # 메모리에 보관할 사진 수 (디스크에는 개수 제한 없이 보관)
+PHOTO_RETRY_AFTER = 600.0        # 초 - 끝내 받지 못한 주소는 이 시간 동안 다시 시도하지 않습니다
+# 디스크 캐시 위치 (.gitignore 의 data/ 아래라 저장소에 올라가지 않습니다)
+PHOTO_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache" / "images"
+PHOTO_MISSING_NOTICE = (
+    "국립국어원 미디어 서버가 늦게 응답해 사진을 불러오지 못했어요. "
+    "아래 🎬 수어 영상 버튼으로 동작을 확인해 주세요."
+)
 PHOTO_FILENAME = "sign"          # 첨부 파일 이름 (확장자는 받은 파일을 보고 붙임 · 단어명이 드러나지 않음)
 PHOTO_USER_AGENT = "Mozilla/5.0 (compatible; LeemisutBot/1.0; +https://github.com/LeeSimYul/Leemisut-bot)"
 
@@ -140,7 +154,11 @@ class Photo:
 
 
 class PhotoError(Exception):
-    """사진을 받았지만 쓸 수 없을 때. (HTTP 오류 · 너무 큼 · 사진이 아님)"""
+    """사진을 받았지만 쓸 수 없을 때. retryable 이면 잠시 뒤 다시 받으면 될 수도 있는 오류(5xx)."""
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def sniff_image(data: bytes) -> str | None:
@@ -156,22 +174,40 @@ def sniff_image(data: bytes) -> str | None:
     return None
 
 
+_DISK_EXTENSIONS = ("jpg", "png", "gif", "webp")
+
+
 class PhotoFetcher:
     """
     임베드 사진을 봇이 직접 받아 첨부 파일로 바꿉니다. (attach)
-    - 한 장에 PHOTO_FETCH_TIMEOUT(2초) · PHOTO_MAX_BYTES(2MB) 까지만 받습니다.
-    - 받은 사진은 PHOTO_CACHE_SIZE 장까지 메모리에 두고 다시 씁니다.
-    - 받지 못한 주소는 PHOTO_RETRY_AFTER(10분) 동안 다시 시도하지 않습니다. (매번 2초씩 늦어지지 않게)
+
+    찾는 순서: 메모리(최근 PHOTO_CACHE_SIZE 장) → 디스크(cache_dir/{주소 해시}.jpg) → 국립국어원
+      - 국립국어원에서는 한 번에 PHOTO_FETCH_TIMEOUT(5초)까지 기다리고, 시간 초과 · 연결 끊김 · 5xx 면
+        PHOTO_RETRY_BACKOFF(0.5초) 쉬고 한 번 더 받습니다. 404 · 사진이 아닌 응답은 다시 받지 않습니다.
+      - 받은 사진은 디스크에 영구 보관합니다. (임시 파일에 쓴 뒤 이름을 바꿔 반쯤 쓴 파일이 남지 않음)
+      - 끝내 받지 못한 주소는 PHOTO_RETRY_AFTER(10분) 동안 다시 시도하지 않습니다.
+      - 같은 주소를 동시에 여러 번 찾으면 한 번만 받고 나눠 씁니다. (미리 받기와 명령어가 겹쳐도)
+    디스크 폴더를 만들 수 없으면 디스크 캐시 없이(메모리만) 동작합니다.
     Cog 가 하나를 만들어 쓰고, Cog 를 내릴 때 close() 합니다.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, cache_dir: Path | None = PHOTO_CACHE_DIR) -> None:
         self._session: aiohttp.ClientSession | None = None
-        self._cache: OrderedDict[str, Photo] = OrderedDict()
+        self._memory: OrderedDict[str, Photo] = OrderedDict()
         self._failed_at: dict[str, float] = {}
-        self._confirmed = False  # 첫 성공을 로그로 한 번 남겼는지
+        self._inflight: dict[str, asyncio.Task[Photo | None]] = {}
+        self._confirmed = False  # 첫 다운로드 성공을 로그로 한 번 남겼는지
+        self.cache_dir: Path | None = None
+        if cache_dir is not None:
+            try:
+                os.makedirs(cache_dir, exist_ok=True)  # 봇이 켜질 때 한 번 (없으면 만듦)
+                self.cache_dir = cache_dir
+            except OSError as exc:
+                log.warning("사진 디스크 캐시 폴더를 만들지 못해 메모리에만 보관합니다: %s (%s)", cache_dir, exc)
 
     async def close(self) -> None:
+        for task in self._inflight.values():
+            task.cancel()
         if self._session is not None:
             await self._session.close()
             self._session = None
@@ -181,11 +217,13 @@ class PhotoFetcher:
             self._session = aiohttp.ClientSession(headers={"User-Agent": PHOTO_USER_AGENT})
         return self._session
 
+    # ── 바깥에서 쓰는 함수 ───────────────────────────────────────
     async def attach(self, embed: discord.Embed) -> Photo | None:
         """
         임베드에 걸린 사진 주소를 받아 와서 attachment:// 로 바꾸고 그 사진을 돌려줍니다.
         보낼 때 send_with_media_fallback(..., photo=사진) 으로 함께 넘겨 주세요.
-        받지 못하면 None 이고, 임베드에는 원본 주소가 그대로 남습니다. (디스코드가 직접 시도)
+        끝내 받지 못하면 사진 칸을 비우고 안내 칸(📷 사진)을 붙인 뒤 None 을 돌려줍니다.
+        (사진이 원래 없는 단어는 아무것도 바꾸지 않습니다)
         """
         url = embed.image.url
         if not url or not url.startswith(("http://", "https://")):
@@ -193,45 +231,108 @@ class PhotoFetcher:
         photo = await self.fetch(url)
         if photo is not None:
             embed.set_image(url=f"attachment://{photo.filename}")
+        else:
+            embed.set_image(url=None)
+            embed.add_field(name="📷 사진", value=PHOTO_MISSING_NOTICE, inline=False)
         return photo
 
-    async def fetch(self, url: str) -> Photo | None:
-        if url in self._cache:
-            self._cache.move_to_end(url)
-            return self._cache[url]
+    async def fetch(self, url: str, *, timeout: float = PHOTO_FETCH_TIMEOUT) -> Photo | None:
+        """
+        사진 한 장을 찾습니다. 못 찾으면 None. (이 함수는 예외를 올리지 않습니다)
+        timeout 은 국립국어원에 한 번 요청할 때 기다리는 시간입니다. (미리 받기는 더 길게)
+        """
+        photo = self._memory.get(url)
+        if photo is not None:
+            self._memory.move_to_end(url)
+            return photo
         failed_at = self._failed_at.get(url)
         if failed_at is not None and time.monotonic() - failed_at < PHOTO_RETRY_AFTER:
             return None
 
-        started = time.monotonic()
+        task = self._inflight.get(url)
+        if task is None:
+            task = asyncio.create_task(self._load(url, timeout))
+            self._inflight[url] = task
+            task.add_done_callback(lambda _t, url=url: self._inflight.pop(url, None))
+        # 이미 받는 중이면(예: 미리 받기) 그 결과를 같이 기다리되, 내 몫의 시간까지만 기다립니다.
+        # 기다리던 쪽이 먼저 포기하거나 취소돼도 받기는 끝까지 해서 디스크에 남깁니다.
+        limit = timeout * PHOTO_FETCH_ATTEMPTS + PHOTO_RETRY_BACKOFF + 1.0
         try:
-            photo = await self._download(url)
-        except (aiohttp.ClientError, asyncio.TimeoutError, PhotoError) as exc:
-            self._failed_at[url] = time.monotonic()
-            reason = str(exc) or type(exc).__name__
-            if isinstance(exc, asyncio.TimeoutError):
-                reason = f"{PHOTO_FETCH_TIMEOUT:g}초 안에 받지 못함"
-            log.warning("수형 사진을 직접 받지 못해 주소만 넘깁니다: %s (%s)", url, reason)
+            return await asyncio.wait_for(asyncio.shield(task), limit)
+        except asyncio.TimeoutError:
             return None
 
+    async def prefetch(self, urls: list[str], *, concurrency: int = 2) -> dict[str, int]:
+        """
+        사진 여러 장을 미리 받아 디스크에 쌓아 둡니다. (기다리는 사람이 없으므로 시간을 넉넉히)
+        반환: {'cached': 이미 있던 장수, 'fetched': 새로 받은 장수, 'failed': 못 받은 장수}
+        """
+        stats = {"cached": 0, "fetched": 0, "failed": 0}
+        gate = asyncio.Semaphore(concurrency)  # 느린 서버에 한꺼번에 몰리지 않도록
+
+        async def one(url: str) -> None:
+            if url in self._memory or await self._disk_path(url) is not None:
+                stats["cached"] += 1
+                return
+            self._failed_at.pop(url, None)  # 미리 받기는 최근 실패 기록과 관계없이 한 번 더 시도
+            async with gate:
+                photo = await self.fetch(url, timeout=PHOTO_PREFETCH_TIMEOUT)
+            stats["fetched" if photo is not None else "failed"] += 1
+
+        await asyncio.gather(*(one(url) for url in dict.fromkeys(urls)))
+        return stats
+
+    # ── 내부 처리 ───────────────────────────────────────────────
+    async def _load(self, url: str, timeout: float) -> Photo | None:
+        """디스크 → 국립국어원 순서로 찾고, 새로 받으면 디스크에 저장합니다."""
+        photo = await self._read_disk(url)
+        if photo is None:
+            started = time.monotonic()
+            try:
+                photo = await self._download_with_retry(url, timeout)
+            except (aiohttp.ClientError, asyncio.TimeoutError, PhotoError) as exc:
+                self._failed_at[url] = time.monotonic()
+                reason = str(exc) or type(exc).__name__
+                if isinstance(exc, asyncio.TimeoutError):
+                    reason = f"{timeout:g}초 안에 받지 못함"
+                log.warning("수형 사진을 받지 못했습니다 (재시도 포함): %s (%s)", url, reason)
+                return None
+            except Exception:
+                # 예상하지 못한 오류도 명령어까지 올리지 않습니다. (사진 없이 보내면 그만)
+                self._failed_at[url] = time.monotonic()
+                log.exception("수형 사진을 받다가 예상하지 못한 오류: %s", url)
+                return None
+            await self._write_disk(url, photo)
+            if not self._confirmed:
+                self._confirmed = True
+                log.info(
+                    "🖼️ 수형 사진 직접 첨부 동작 확인: %s (%.1fKB · %.2f초)",
+                    url, len(photo.data) / 1024, time.monotonic() - started,
+                )
+
         self._failed_at.pop(url, None)
-        self._cache[url] = photo
-        if len(self._cache) > PHOTO_CACHE_SIZE:
-            self._cache.popitem(last=False)  # 가장 오래 안 쓴 사진부터 버립니다
-        if not self._confirmed:
-            self._confirmed = True
-            log.info(
-                "🖼️ 수형 사진 직접 첨부 동작 확인: %s (%.1fKB · %.2f초)",
-                url, len(photo.data) / 1024, time.monotonic() - started,
-            )
+        self._memory[url] = photo
+        self._memory.move_to_end(url)
+        if len(self._memory) > PHOTO_CACHE_SIZE:
+            self._memory.popitem(last=False)  # 가장 오래 안 쓴 사진부터 메모리에서 뺍니다 (디스크엔 남음)
         return photo
 
-    async def _download(self, url: str) -> Photo:
+    async def _download_with_retry(self, url: str, timeout: float) -> Photo:
+        for attempt in range(1, PHOTO_FETCH_ATTEMPTS + 1):
+            try:
+                return await self._download(url, timeout)
+            except (aiohttp.ClientError, asyncio.TimeoutError, PhotoError) as exc:
+                if attempt == PHOTO_FETCH_ATTEMPTS or not _retryable(exc):
+                    raise
+                log.info("사진 받기 다시 시도 (%s): %s", str(exc) or type(exc).__name__, url)
+                await asyncio.sleep(PHOTO_RETRY_BACKOFF * attempt)
+        raise AssertionError("unreachable")
+
+    async def _download(self, url: str, timeout: float) -> Photo:
         session = self._ensure_session()
-        timeout = aiohttp.ClientTimeout(total=PHOTO_FETCH_TIMEOUT)
-        async with session.get(url, timeout=timeout) as resp:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
             if resp.status != 200:
-                raise PhotoError(f"HTTP {resp.status}")
+                raise PhotoError(f"HTTP {resp.status}", retryable=resp.status >= 500 or resp.status == 429)
             if resp.content_length is not None and resp.content_length > PHOTO_MAX_BYTES:
                 raise PhotoError(f"파일이 너무 큼 ({resp.content_length:,}바이트)")
             chunks: list[bytes] = []
@@ -248,6 +349,64 @@ class PhotoFetcher:
         if extension is None:
             raise PhotoError(f"사진 파일이 아님 (Content-Type: {content_type} · {len(data)}바이트)")
         return Photo(data, f"{PHOTO_FILENAME}.{extension}")
+
+    # ── 디스크 캐시 (읽기 · 쓰기는 별도 스레드) ─────────────────
+    def _disk_stem(self, url: str) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        return self.cache_dir / hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
+
+    async def _disk_path(self, url: str) -> Path | None:
+        stem = self._disk_stem(url)
+        if stem is None:
+            return None
+
+        def find() -> Path | None:
+            for extension in _DISK_EXTENSIONS:
+                path = stem.with_suffix(f".{extension}")
+                if path.is_file():
+                    return path
+            return None
+
+        return await asyncio.to_thread(find)
+
+    async def _read_disk(self, url: str) -> Photo | None:
+        path = await self._disk_path(url)
+        if path is None:
+            return None
+        try:
+            data = await asyncio.to_thread(path.read_bytes)
+        except OSError as exc:
+            log.warning("디스크에 저장된 사진을 읽지 못했습니다: %s (%s)", path, exc)
+            return None
+        extension = sniff_image(data)
+        if extension is None:  # 깨진 파일은 지우고 다시 받습니다
+            await asyncio.to_thread(path.unlink, missing_ok=True)
+            return None
+        return Photo(data, f"{PHOTO_FILENAME}.{extension}")
+
+    async def _write_disk(self, url: str, photo: Photo) -> None:
+        stem = self._disk_stem(url)
+        if stem is None:
+            return
+        path = stem.with_suffix("." + photo.filename.rsplit(".", 1)[-1])
+
+        def write() -> None:
+            temp = path.with_name(path.name + ".tmp")
+            temp.write_bytes(photo.data)
+            os.replace(temp, path)  # 다 쓴 뒤에 이름을 바꿔, 읽는 쪽이 반쯤 쓴 파일을 보지 않게 합니다
+
+        try:
+            await asyncio.to_thread(write)
+        except OSError as exc:
+            log.warning("받은 사진을 디스크에 저장하지 못했습니다: %s (%s)", path, exc)
+
+
+def _retryable(exc: BaseException) -> bool:
+    """잠시 뒤 다시 받으면 될 수도 있는 오류인지. (시간 초과 · 연결 끊김 · 5xx)"""
+    if isinstance(exc, PhotoError):
+        return exc.retryable
+    return isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError, aiohttp.ClientPayloadError))
 
 
 # ── 링크 버튼 ───────────────────────────────────────────────────
