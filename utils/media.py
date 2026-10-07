@@ -74,7 +74,19 @@ PHOTO_MISSING_NOTICE = (
     "아래 🎬 수어 영상 버튼으로 동작을 확인해 주세요."
 )
 PHOTO_FILENAME = "sign"          # 첨부 파일 이름 (확장자는 받은 파일을 보고 붙임 · 단어명이 드러나지 않음)
-PHOTO_USER_AGENT = "Mozilla/5.0 (compatible; LeemisutBot/1.0; +https://github.com/LeeSimYul/Leemisut-bot)"
+# 국립국어원에 사진을 요청할 때의 헤더 - 일반 브라우저와 같은 모양으로 보냅니다.
+# 운영 VM 에서 curl 기본 요청은 200 으로 받았는데, 'LeemisutBot' 이 든 User-Agent 로 보낸 요청은
+# 응답 없이 모두 시간 초과됐습니다(2026-10-07). 디스코드 프록시('Discordbot')도 사진을 못 가져왔으므로
+# 이름에 bot 이 든 요청을 방화벽이 버리는 것으로 보고 브라우저 헤더를 씁니다.
+# (사진마다 처음 한 번만 받고 디스크에 보관하므로 국립국어원에 가는 요청 수는 많지 않습니다)
+PHOTO_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Referer": "http://sldict.korean.go.kr/",
+    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+}
 
 _reported_unusable: set[str] = set()  # 형식 오류로 건너뛴 사진 주소 (같은 경고를 반복하지 않도록)
 
@@ -214,7 +226,7 @@ class PhotoFetcher:
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(headers={"User-Agent": PHOTO_USER_AGENT})
+            self._session = aiohttp.ClientSession(headers=PHOTO_REQUEST_HEADERS)
         return self._session
 
     # ── 바깥에서 쓰는 함수 ───────────────────────────────────────
