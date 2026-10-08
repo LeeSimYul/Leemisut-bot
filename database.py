@@ -25,7 +25,8 @@ database.py
     word_name  단어명 (중복 허용 - 동음이의어)
     meaning    수어 설명 전문
     video_url  동영상 파일 주소
-    image_url  수형 사진 주소 (임베드에 직접 표시)
+    image_url  수형 사진 주소 (대표 1장 · 예전 데이터 호환용)
+    image_urls 수형 이미지 주소 전체 (API signImages 의 n건 · 줄바꿈으로 구분 · 비어 있으면 image_url 만 씀)
     category   분류항목
     detail_url 사전 상세 페이지 (퀴즈 중에는 숨김)
     UNIQUE(word_name, video_url)
@@ -98,7 +99,7 @@ CONNECT_RETRIES = 3          # Neon 등은 절전에서 깨어나며 첫 연결�
 CONNECT_RETRY_DELAY = 2.0    # 초
 
 # 저장할 컬럼 순서 (튜플 순서와 동일하게 유지해 주세요)
-COLUMNS = ("word_name", "meaning", "video_url", "image_url", "category", "detail_url")
+COLUMNS = ("word_name", "meaning", "video_url", "image_url", "category", "detail_url", "image_urls")
 
 # 초기 테스트용 더미 데이터 (word_name, meaning, video_url, image_url, category, detail_url)
 # ⚠️ /수어전체동기화 를 하면 실제 자료로 채워집니다.
@@ -136,6 +137,7 @@ SQLITE_SCHEMA: tuple[str, ...] = (
         image_url  TEXT    NOT NULL DEFAULT '',
         category   TEXT    NOT NULL DEFAULT '일반',
         detail_url TEXT    NOT NULL DEFAULT '',
+        image_urls TEXT    NOT NULL DEFAULT '',      -- 수형 이미지 전체 (줄바꿈 구분)
         UNIQUE(word_name, video_url)                 -- 같은 단어라도 영상이 다르면 별개
     )
     """,
@@ -201,6 +203,7 @@ POSTGRES_SCHEMA: tuple[str, ...] = (
         image_url  TEXT NOT NULL DEFAULT '',
         category   TEXT NOT NULL DEFAULT '일반',
         detail_url TEXT NOT NULL DEFAULT '',
+        image_urls TEXT NOT NULL DEFAULT '',
         CONSTRAINT sign_words_name_video_key UNIQUE (word_name, video_url)
     )
     """,
@@ -778,6 +781,7 @@ class Database:
         """
         await self.backend.execute_script(self.backend.schema)
         await self._migrate_sqlite_legacy()
+        await self._migrate_image_urls()
         await self._migrate_quiz_notes()
 
         if self.seed_mock and await self.count_words() == 0:
@@ -860,6 +864,27 @@ class Database:
             PRAGMA foreign_keys=on;
             """
         )
+
+    async def _migrate_image_urls(self) -> None:
+        """
+        sign_words 에 image_urls(수형 이미지 전체) 컬럼이 없으면 추가합니다. (SQLite · PostgreSQL 공통)
+        기존 단어는 빈 값이라 대표 사진(image_url) 1장만 쓰다가, /수어전체동기화 를 하면 채워집니다.
+        """
+        if isinstance(self.backend, SQLiteBackend):
+            rows = await self.backend.fetch_all("PRAGMA table_info(sign_words)")
+            exists = "image_urls" in {row[1] for row in rows}
+        else:
+            row = await self.backend.fetch_one(
+                "SELECT COUNT(*) AS cnt FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'sign_words' AND column_name = 'image_urls'"
+            )
+            exists = bool(row and int(row["cnt"]))
+        if not exists:
+            await self.backend.execute(
+                "ALTER TABLE sign_words ADD COLUMN image_urls TEXT NOT NULL DEFAULT ''"
+            )
+            log.info("🖼️ sign_words 에 image_urls(수형 이미지 전체) 컬럼을 추가했습니다. (/수어전체동기화 로 채워짐)")
 
     async def _migrate_quiz_notes(self) -> None:
         """
@@ -1181,7 +1206,7 @@ class Database:
     async def sync_api_words(self, words_data: list[tuple[str, ...]]) -> int:
         """
         API에서 받아 온 단어들을 저장합니다.
-        (word_name, meaning, video_url[, image_url, category, detail_url]) 형태를 모두 받습니다.
+        (word_name, meaning, video_url[, image_url, category, detail_url[, image_urls]]) 형태를 모두 받습니다.
 
         중복 판정은 (word_name, video_url) 복합 기준입니다.
         같은 단어라도 영상이 다르면 동음이의어로 보고 따로 저장하고,
@@ -1199,7 +1224,7 @@ class Database:
                 row = (row[0], row[1], row[2], "", row[3], "")
             elif len(row) == 5:  # (name, meaning, video, category, detail)
                 row = (row[0], row[1], row[2], "", row[3], row[4])
-            rows.append(row + ("",) * (6 - len(row)))
+            rows.append(row + ("",) * (7 - len(row)))
 
         before = await self.count_words()
         try:
@@ -1207,13 +1232,14 @@ class Database:
                 await self.backend.execute_many(
                     """
                     INSERT INTO sign_words
-                        (word_name, meaning, video_url, image_url, category, detail_url)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                        (word_name, meaning, video_url, image_url, category, detail_url, image_urls)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (word_name, video_url) DO UPDATE SET
                         meaning    = excluded.meaning,
                         image_url  = excluded.image_url,
                         category   = excluded.category,
-                        detail_url = excluded.detail_url
+                        detail_url = excluded.detail_url,
+                        image_urls = excluded.image_urls
                     """,
                     rows,
                 )

@@ -15,12 +15,14 @@ utils/ksl_api.py
     fetch_all_sign_words()          → 전체 데이터를 페이지 순회로 수집
     KSLApiError                     → 이 모듈이 던지는 모든 오류의 상위 클래스
 
-    세 함수 모두 [(word_name, meaning, video_url, image_url, category, detail_url), ...]
+    세 함수 모두 [(word_name, meaning, video_url, image_url, category, detail_url, image_urls), ...]
     형태를 돌려줍니다. database.sync_api_words() 에 그대로 넣으시면 됩니다.
+    (image_urls 는 signImages 의 수형 이미지 전체를 줄바꿈으로 이은 문자열)
 """
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import os
 import re
@@ -55,6 +57,7 @@ __all__ = [
     "filter_words",
     "is_media_url",
     "pick_image_url",
+    "pick_image_urls",
     "BASE_URL",
 ]
 
@@ -205,7 +208,7 @@ def normalize_meaning(raw: str, fallback: str = DEFAULT_MEANING) -> str:
     if not raw:
         return fallback
     text = _HTML_TAG.sub("", str(raw))
-    text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    text = html.unescape(text)  # &#8231; → ‧ · &amp; → & 등 HTML 문자 참조를 모두 글자로
     text = " ".join(text.split()).strip()
     return text or fallback
 
@@ -228,14 +231,16 @@ class SignWord:
     meaning: str
     video_url: str        # 동영상 파일 주소 (퀴즈에서 노출해도 안전)
     category: str
-    image_url: str = ""   # 수형 사진 (임베드에 직접 표시 - 본문에 주소가 안 보임)
+    image_url: str = ""   # 수형 사진 대표 1장 (예전 데이터 호환용)
     detail_url: str = ""  # 사전 상세 페이지 (정답이 보이므로 퀴즈 중에는 숨김)
+    image_urls: tuple[str, ...] = ()  # 수형 이미지 전체 (signImages n건 · 순서 유지)
 
-    def as_row(self) -> tuple[str, str, str, str, str, str]:
+    def as_row(self) -> tuple[str, str, str, str, str, str, str]:
         """database.sync_api_words() 가 받는 튜플 형태로 변환합니다."""
         return (
             self.word_name, self.meaning, self.video_url,
             self.image_url, self.category, self.detail_url,
+            "\n".join(self.image_urls),
         )
 
 
@@ -303,6 +308,7 @@ def evaluate_word(item: dict[str, Any], keyword: str = "") -> SignWord | Rejecte
         category=category,
         image_url=pick_image_url(item),
         detail_url=pick_detail_url(item),
+        image_urls=pick_image_urls(item),
     )
 
 
@@ -404,6 +410,18 @@ def pick_image_url(item: dict[str, Any]) -> str:
         if _is_url(value) and _has_ext(value, _IMAGE_EXT):
             return value
     return ""
+
+
+def pick_image_urls(item: dict[str, Any]) -> tuple[str, ...]:
+    """
+    수형 이미지 주소를 전부 모읍니다. (signImages 는 쉼표로 n건 · 받은 순서 유지 · 중복 제거)
+    영상 캡처인지 삽화인지는 여기서 가리지 않고, 보여 줄 때 utils.media.pick_images 가 고릅니다.
+    """
+    urls = [
+        value for value in _values(item, ("signImages",), split_commas=True)
+        if _is_url(value) and _has_ext(value, _IMAGE_EXT)
+    ]
+    return tuple(dict.fromkeys(urls))
 
 
 def pick_meaning(item: dict[str, Any]) -> str:

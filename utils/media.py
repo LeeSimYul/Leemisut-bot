@@ -35,7 +35,7 @@ import re
 import socket
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
@@ -81,6 +81,21 @@ PHOTO_MISSING_NOTICE = (
     "아래 버튼으로 영상을 확인해 주세요. (사전 서버가 멈춘 동안은 링크도 열리지 않을 수 있어요)"
 )
 PHOTO_FILENAME = "sign"          # 첨부 파일 이름 (확장자는 받은 파일을 보고 붙임 · 단어명이 드러나지 않음)
+
+# ── 수형 이미지 여러 장 → 한 장(스토리보드) ──
+STORYBOARD_MAX_IMAGES = 6        # 한 장으로 이어 붙일 최대 이미지 수
+STORYBOARD_PER_ROW = 3           # 한 줄에 놓을 장수 (넘으면 다음 줄 · 모바일에서 너무 작아지지 않게)
+STORYBOARD_MAX_HEIGHT = 360      # 칸 높이 상한(px) - 모든 칸을 같은 높이로 맞춥니다
+STORYBOARD_GAP = 28              # 칸 사이 간격(px) - 가운데에 ▶ 화살표
+STORYBOARD_ROW_GAP = 14          # 줄 사이 간격(px)
+STORYBOARD_PAD = 10              # 바깥 여백(px)
+STORYBOARD_BG = (242, 243, 245)  # 배경 (밝은 회색 - 디스코드 밝은/어두운 화면 모두 무난)
+STORYBOARD_BADGE = (88, 101, 242)  # 순서 번호 동그라미 (디스코드 보라)
+STORYBOARD_ARROW = (153, 170, 181)
+STORYBOARD_CACHE_SIZE = 128      # 만든 스토리보드를 메모리에 보관할 수
+
+# 영상 첫 장면을 캡처한 사진의 파일 이름 (예: MOV000265527_215X161.jpg) - 삽화가 있으면 이건 뺍니다
+_VIDEO_FRAME_NAME = re.compile(r"^MOV\d+_\d+x\d+$", re.IGNORECASE)
 # 국립국어원에 사진을 요청할 때의 헤더 - 일반 브라우저와 같은 모양으로 보냅니다.
 # ⚠️ 2026-10-07~08: 운영 VM(오사카) · 국내 PC · 일반 브라우저 모두 sldict.korean.go.kr 사진에 연결되지
 #    않았습니다. (헤더와 무관 · 연결 시간 초과) 서버 쪽 장애로 보이며, 받을 수 있게 되면
@@ -208,6 +223,97 @@ def pick_image(image_url: str | None, video_url: str | None) -> str:
     return ""
 
 
+def is_video_frame(url: str) -> bool:
+    """영상 캡처 사진처럼 생긴 파일 이름인지. (MOV{번호}_{가로}X{세로}.jpg)"""
+    stem = urlsplit(url).path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    return bool(_VIDEO_FRAME_NAME.match(stem))
+
+
+def pick_images(image_urls: str | None, image_url: str | None, video_url: str | None) -> list[str]:
+    """
+    임베드에 보여 줄 수형 이미지를 고릅니다. (검증만 한 원본 주소들 · 최대 STORYBOARD_MAX_IMAGES 장)
+      1) image_urls(API signImages 전체)에 영상 캡처가 아닌 이미지(삽화 등)가 있으면 그것들만
+      2) 모두 영상 캡처 모양이면 전부 (여러 장이면 동작 순서대로 이어 붙여 보여 줌)
+      3) image_urls 가 비어 있으면(동기화 전 예전 데이터) 대표 사진 1장 (pick_image)
+    """
+    candidates: list[str] = []
+    for raw in (image_urls or "").splitlines():
+        if is_image_url(raw):
+            url = secure_url(raw, upgrade=False)
+            if url not in candidates:
+                candidates.append(url)
+    chosen = [url for url in candidates if not is_video_frame(url)] or candidates
+    if chosen:
+        return chosen[:STORYBOARD_MAX_IMAGES]
+    single = pick_image(image_url, video_url)
+    return [single] if single else []
+
+
+def _badge_font(size: int) -> Any:
+    from PIL import ImageFont
+
+    try:
+        return ImageFont.load_default(size=size)  # Pillow 10.1+ (크기 지정 가능한 기본 글꼴)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def compose_storyboard(images: Sequence[bytes]) -> bytes:
+    """
+    여러 장의 수형 이미지를 순서 번호(①②③)와 ▶ 화살표를 넣어 한 장의 JPEG 로 이어 붙입니다.
+    모든 칸을 같은 높이로 맞추고, STORYBOARD_PER_ROW 장마다 줄을 바꿉니다.
+    (Pillow 가 필요합니다 · 시간이 조금 걸리므로 asyncio.to_thread 로 부르세요)
+    """
+    from PIL import Image, ImageDraw
+
+    frames = []
+    for data in images:
+        with Image.open(io.BytesIO(data)) as source:
+            source.seek(0)  # 움직이는 gif 는 첫 장면
+            frames.append(source.convert("RGB"))
+    if not frames:
+        raise ValueError("이어 붙일 이미지가 없습니다.")
+
+    height = min(max(frame.height for frame in frames), STORYBOARD_MAX_HEIGHT)
+    frames = [
+        frame if frame.height == height
+        else frame.resize((max(1, round(frame.width * height / frame.height)), height), Image.LANCZOS)
+        for frame in frames
+    ]
+    rows = [frames[i: i + STORYBOARD_PER_ROW] for i in range(0, len(frames), STORYBOARD_PER_ROW)]
+    width = max(sum(f.width for f in row) + STORYBOARD_GAP * (len(row) - 1) for row in rows)
+    canvas = Image.new(
+        "RGB",
+        (width + STORYBOARD_PAD * 2,
+         len(rows) * height + (len(rows) - 1) * STORYBOARD_ROW_GAP + STORYBOARD_PAD * 2),
+        STORYBOARD_BG,
+    )
+    draw = ImageDraw.Draw(canvas)
+    radius = max(11, height // 14)
+    font = _badge_font(round(radius * 1.2))
+
+    number = 1
+    y = STORYBOARD_PAD
+    for row in rows:
+        x = STORYBOARD_PAD
+        for index, frame in enumerate(row):
+            canvas.paste(frame, (x, y))
+            cx, cy = x + radius + 6, y + radius + 6
+            draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=STORYBOARD_BADGE, outline="white", width=2)
+            draw.text((cx, cy), str(number), fill="white", font=font, anchor="mm")
+            number += 1
+            x += frame.width
+            if index < len(row) - 1:
+                ax, ay = x + STORYBOARD_GAP // 2, y + height // 2
+                draw.polygon([(ax - 6, ay - 9), (ax - 6, ay + 9), (ax + 8, ay)], fill=STORYBOARD_ARROW)
+                x += STORYBOARD_GAP
+        y += height + STORYBOARD_ROW_GAP
+
+    out = io.BytesIO()
+    canvas.save(out, "JPEG", quality=88, optimize=True)
+    return out.getvalue()
+
+
 # ── 사진 직접 받기 ──────────────────────────────────────────────
 @dataclass(frozen=True)
 class Photo:
@@ -276,6 +382,7 @@ class PhotoFetcher:
         self._host_open_until: dict[str, float] = {}  # 서버 차단기가 열려 있는(요청 안 함) 시각까지
         self._session: aiohttp.ClientSession | None = None
         self._memory: OrderedDict[str, Photo] = OrderedDict()
+        self._boards: OrderedDict[tuple[str, ...], Photo] = OrderedDict()  # 만든 스토리보드
         self._failed_at: dict[str, float] = {}
         self._inflight: dict[str, asyncio.Task[Photo | None]] = {}
         self._confirmed = False  # 첫 다운로드 성공을 로그로 한 번 남겼는지
@@ -300,23 +407,51 @@ class PhotoFetcher:
         return self._session
 
     # ── 바깥에서 쓰는 함수 ───────────────────────────────────────
-    async def attach(self, embed: discord.Embed) -> Photo | None:
+    async def attach(self, embed: discord.Embed, urls: Sequence[str] | None = None) -> Photo | None:
         """
-        임베드에 걸린 사진 주소를 받아 와서 attachment:// 로 바꾸고 그 사진을 돌려줍니다.
+        수형 이미지를 받아 와서 attachment:// 로 바꾸고 보낼 사진을 돌려줍니다.
+        urls 를 생략하면 임베드에 걸린 사진 1장을 씁니다. (urls 는 utils.media.pick_images 결과)
+          - 1장이면 그대로, 여러 장이면 순서 번호를 붙여 한 장으로 이어 붙인 스토리보드로 보냅니다.
+          - 일부만 받았으면 받은 것만 이어 붙입니다.
         보낼 때 send_with_media_fallback(..., photo=사진) 으로 함께 넘겨 주세요.
-        끝내 받지 못하면 사진 칸을 비우고 안내 칸(📷 사진)을 붙인 뒤 None 을 돌려줍니다.
+        끝내 한 장도 받지 못하면 사진 칸을 비우고 안내 칸(📷 사진)을 붙인 뒤 None 을 돌려줍니다.
         (사진이 원래 없는 단어는 아무것도 바꾸지 않습니다)
         """
-        url = embed.image.url
-        if not url or not url.startswith(("http://", "https://")):
+        targets = [
+            url for url in (urls if urls is not None else [embed.image.url or ""])
+            if url and url.startswith(("http://", "https://"))
+        ]
+        if not targets:
             return None
-        photo = await self.fetch(url)
-        if photo is not None:
-            embed.set_image(url=f"attachment://{photo.filename}")
-        else:
+        results = await asyncio.gather(*(self.fetch(url) for url in targets))
+        received = [(url, photo) for url, photo in zip(targets, results) if photo is not None]
+        if not received:
             embed.set_image(url=None)
             embed.add_field(name="📷 사진", value=PHOTO_MISSING_NOTICE, inline=False)
+            return None
+        if len(received) == 1:
+            photo = received[0][1]
+        else:
+            photo = await self._storyboard(tuple(url for url, _ in received), [p for _, p in received])
+        embed.set_image(url=f"attachment://{photo.filename}")
         return photo
+
+    async def _storyboard(self, key: tuple[str, ...], photos: list[Photo]) -> Photo:
+        """여러 장을 한 장으로 이어 붙입니다. (만든 것은 보관 · 실패하면 첫 장만)"""
+        board = self._boards.get(key)
+        if board is not None:
+            self._boards.move_to_end(key)
+            return board
+        try:
+            data = await asyncio.to_thread(compose_storyboard, [p.data for p in photos])
+        except Exception:  # Pillow 가 없거나 깨진 이미지 등 - 사진을 아예 빼지는 않습니다
+            log.exception("수형 이미지 %d장을 이어 붙이지 못해 첫 장만 보냅니다: %s", len(photos), key[0])
+            return photos[0]
+        board = Photo(data, f"{PHOTO_FILENAME}.jpg")
+        self._boards[key] = board
+        if len(self._boards) > STORYBOARD_CACHE_SIZE:
+            self._boards.popitem(last=False)
+        return board
 
     async def fetch(self, url: str, *, timeout: float = PHOTO_FETCH_TIMEOUT) -> Photo | None:
         """
@@ -577,12 +712,21 @@ def has_media(embed: discord.Embed, view: discord.ui.View | None) -> bool:
 
 
 def strip_media(embed: discord.Embed, view: discord.ui.View | None) -> None:
-    """사진 · 썸네일 · 제목 링크 · 링크 버튼을 뺍니다. 설명 칸 안의 글 링크는 남습니다."""
+    """
+    사진 · 썸네일 · 제목 링크 · 링크 버튼을 뺍니다.
+    뺀 링크 버튼은 '🔗 바로가기' 글 링크 칸으로 옮겨, 다시 보낸 메시지에서도 영상 · 사전으로 갈 수 있게 합니다.
+    (평소에는 버튼만 쓰고 글 링크는 두지 않으므로, 버튼이 빠질 때만 대신 붙입니다)
+    """
     embed.set_image(url=None)
     embed.set_thumbnail(url=None)
     embed.url = None
+    links = []
     for item in _link_items(view):
         view.remove_item(item)  # type: ignore[union-attr]
+        label = f"{item.emoji} {item.label}" if item.emoji else str(item.label)
+        links.append(f"[{label}]({item.url})")
+    if links:
+        embed.add_field(name="🔗 바로가기", value=" · ".join(links)[:1024], inline=False)
 
 
 async def send_with_media_fallback(

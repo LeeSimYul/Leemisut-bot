@@ -11,7 +11,7 @@ scripts/bulk_download_images.py
 
 ■ 파일 이름 규칙은 봇과 같습니다
     봇이 쓰는 코드를 그대로 불러 씁니다.
-      - 사진 주소 고르기 : utils.media.pick_image  (봇의 word_image 와 같은 함수)
+      - 사진 주소 고르기 : utils.media.pick_images (봇의 word_images 와 같은 함수 · 단어마다 여러 장)
       - 받기 · 검사 · 저장 : utils.media.PhotoFetcher (data/cache/images/{주소 해시}.jpg)
     https 로 받더라도 파일 이름은 DB 에 있는 원래 주소 기준이라 봇이 찾는 이름과 똑같습니다.
 
@@ -234,14 +234,14 @@ class Progress:
 # ── 받기 ────────────────────────────────────────────────────────
 async def load_image_urls(args: argparse.Namespace) -> tuple[dict[str, str], int, int, str]:
     """
-    DB 에서 단어를 읽어 봇과 같은 규칙으로 사진 주소를 고릅니다.
+    DB 에서 단어를 읽어 봇과 같은 규칙으로 사진 주소를 고릅니다. (수형 이미지가 여러 장이면 모두)
     반환: ({사진 주소: 단어명}, 전체 단어 수, 사진 주소가 저장된 단어 수, DB 설명)
     """
     db = Database(args.sqlite, dsn=args.dsn, seed_mock=False)  # 더미 단어를 넣지 않습니다
     await db.connect()
     try:
         rows = await db.backend.fetch_all(
-            "SELECT word_id, word_name, image_url, video_url FROM sign_words ORDER BY word_id"
+            "SELECT word_id, word_name, image_url, image_urls, video_url FROM sign_words ORDER BY word_id"
         )
         described = db.describe()
     finally:
@@ -250,11 +250,11 @@ async def load_image_urls(args: argparse.Namespace) -> tuple[dict[str, str], int
     urls: dict[str, str] = {}
     with_image = 0
     for row in rows:
-        if row["image_url"]:
+        if row["image_url"] or row["image_urls"]:
             with_image += 1
-        url = media.pick_image(row["image_url"], row["video_url"])  # 봇의 word_image() 와 같은 규칙
-        if url and url not in urls:
-            urls[url] = row["word_name"]
+        # 봇의 word_images() 와 같은 규칙 (스토리보드는 봇이 받은 이미지로 그때그때 만듭니다)
+        for url in media.pick_images(row["image_urls"], row["image_url"], row["video_url"]):
+            urls.setdefault(url, row["word_name"])
     return urls, len(rows), with_image, described
 
 

@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS sign_words (
     image_url  TEXT NOT NULL DEFAULT '',
     category   TEXT NOT NULL DEFAULT '일반',
     detail_url TEXT NOT NULL DEFAULT '',
+    image_urls TEXT NOT NULL DEFAULT '',   -- 수형 이미지 전체 (API signImages · 줄바꿈 구분)
     CONSTRAINT sign_words_name_video_key UNIQUE (word_name, video_url)
 );
 

@@ -7,10 +7,14 @@ cogs/sign_language.py
 ■ /오늘의수어 는 유저마다 다른 단어를 배정하고, 하루 한 번 출석 보상을 줍니다.
 ■ 링크 표기 원칙
    - 메시지 본문(content)에는 주소를 넣지 않습니다. 긴 URL이 그대로 보이기 때문입니다.
-   - 영상·사전 링크는 임베드 안의 마스크 링크([보이는 글](주소))와, 메시지 아래의
-     링크 버튼(🎬 수어 영상 보기 · 📖 국립국어원 사전) 두 곳에 함께 붙입니다.
-     버튼은 모바일에서 누르기 쉽고, 글 링크는 버튼이 빠지는 상황(아래 400 대비)에도 남습니다.
+   - 단어 카드(/오늘의수어 · /수어검색 · 퀴즈 · 오답노트 상세)의 영상·사전 링크는 메시지 아래
+     링크 버튼(🎬 수어 영상 보기 · 📖 국립국어원 사전)으로만 붙입니다. (본문 글 링크와 겹치지 않게)
+     제목을 누르면 사전으로 가는 것은 그대로입니다.
+   - 버튼을 붙일 수 없는 목록(/오답노트 · /수어단어장 페이지)은 단어마다 글 링크를 붙입니다.
+■ 수어 설명의 HTML 문자 참조(&#8231; 등)는 보여 줄 때 글자로 바꿉니다. (clean_text)
 ■ 미디어 (utils/media.py)
+   - 수형 이미지가 여러 장이면(API signImages · image_urls 컬럼) 순서 번호를 붙여 한 장으로 이어 붙인
+     스토리보드로 보여 줍니다. 영상 캡처가 아닌 이미지(삽화)가 있으면 그것만 고릅니다. (word_images)
    - 수형 사진은 임베드 본문 아래 이미지(set_image)로 띄웁니다. 원본이 215×161 이라
      오른쪽 위 썸네일(80×80)로 줄이면 모바일에서 손 모양이 보이지 않습니다.
    - 사진은 봇이 직접 받아 첨부 파일(attachment://sign.jpg)로 올립니다. (PhotoFetcher)
@@ -44,6 +48,7 @@ cogs/sign_language.py
 from __future__ import annotations
 
 import contextlib
+import html
 import logging
 import random
 import re
@@ -62,7 +67,7 @@ from utils.media import (
     is_video_url,
     link_buttons,
     link_view,
-    pick_image,
+    pick_images,
     secure_url,
     send_with_media_fallback,
 )
@@ -184,9 +189,15 @@ def _row_get(row: Row, key: str, default: str = "") -> str:
     return value if value else default
 
 
+def word_images(word: Row) -> list[str]:
+    """임베드에 띄울 수형 이미지 주소들. (여러 장이면 스토리보드로 이어 붙임 · 없으면 빈 목록)"""
+    return pick_images(_row_get(word, "image_urls"), _row_get(word, "image_url"), word["video_url"])
+
+
 def word_image(word: Row) -> str:
-    """임베드에 띄울 수형 사진 주소. (검증만 한 원본 주소, 없으면 빈 문자열)"""
-    return pick_image(_row_get(word, "image_url"), word["video_url"])
+    """대표 수형 이미지 1장. (검증만 한 원본 주소, 없으면 빈 문자열)"""
+    images = word_images(word)
+    return images[0] if images else ""
 
 
 def has_quiz_media(word: Row) -> bool:
@@ -205,9 +216,14 @@ def masked(label: str, url: str) -> str:
     return f"[{label}]({url})" if url else ""
 
 
+def clean_text(text: str | None) -> str:
+    """DB 에 남아 있는 HTML 문자 참조를 글자로 바꿉니다. (4&#8231;5지 → 4‧5지 · &amp; → &)"""
+    return html.unescape(text or "")
+
+
 def summarize(meaning: str, limit: int = 45) -> str:
     """목록에서 동음이의어를 구분할 수 있을 만큼만 뜻을 줄입니다."""
-    text = " ".join((meaning or "").split())
+    text = " ".join(clean_text(meaning).split())
     return text if len(text) <= limit else text[:limit] + "…"
 
 
@@ -216,7 +232,7 @@ def add_full_text_field(embed: discord.Embed, name: str, text: str) -> None:
     긴 글을 잘라내지 않고 넣습니다.
     한 칸(1024자)을 넘으면 문장 단위로 나눠 '(이어서)' 칸을 추가합니다.
     """
-    text = (text or "").strip()
+    text = clean_text(text).strip()
     if not text:
         return
 
@@ -276,11 +292,7 @@ def build_word_embed(
     detail_url = secure_url(_row_get(word, "detail_url"))
     embed = discord.Embed(title=title, url=detail_url or None, color=color)
     add_full_text_field(embed, "✋ 수어 설명", word["meaning"])
-
-    links = link_field_value(word, include_detail=True)
-    if links:
-        embed.add_field(name="🔗 바로가기", value=links, inline=False)
-
+    # 영상 · 사전 링크는 메시지 아래 버튼(word_link_view)으로만 붙입니다.
     content = set_media(embed, word)
     return embed, content
 
@@ -388,11 +400,7 @@ def build_quiz_embed(
         color=COLOR_QUIZ,
     )
     content = set_media(embed, answer)
-
-    # 영상 링크는 마스크 링크 · 링크 버튼으로만 (주소에 단어가 드러나지 않습니다)
-    video_link = masked("🎬 영상으로 문제 보기", answer["video_url"])
-    if video_link:
-        embed.add_field(name="문제 영상", value=video_link, inline=False)
+    # 영상은 보기 아래 '🎬 수어 영상 보기' 버튼으로만 (주소에 단어가 드러나지 않습니다)
     embed.set_footer(text=footer)
     return embed, content
 
@@ -610,15 +618,12 @@ class SignQuizView(discord.ui.View):
         )
 
     def _finish_embed(self) -> None:
-        """정답 공개 후에만 설명 전문과 사전 링크(제목 · 글 링크 · 버튼)를 붙입니다."""
+        """정답 공개 후에만 설명 전문과 사전 링크(제목 · 버튼)를 붙입니다."""
         self.embed.clear_fields()
         # 제목을 누르면 사전 상세 페이지로 이동합니다. (정답 공개 후이므로 안전)
         if self.detail_url:
             self.embed.url = self.detail_url
         add_full_text_field(self.embed, "✋ 수어 설명", self.answer["meaning"])
-        links = link_field_value(self.answer, include_detail=True)
-        if links:
-            self.embed.add_field(name="🔗 바로가기", value=links, inline=False)
         for button in link_buttons(detail_url=self.detail_url, row=1):
             self.add_item(button)
         self.embed.set_footer(text=self.finish_footer)
@@ -782,7 +787,7 @@ class NotesPaginatorView(SignPaginatorView):
 
         word = self.words[index]
         embed, content = build_note_detail_embed(word)
-        photo = await self.photos.attach(embed)
+        photo = await self.photos.attach(embed, word_images(word))
         await send_with_media_fallback(
             interaction.followup.send,
             embed=embed, view=word_link_view(word), photo=photo, content=content, ephemeral=True,
@@ -827,9 +832,8 @@ class SignLanguage(commands.Cog, name="수어"):
             urls: list[str] = []
             for user_id in user_ids:
                 word = await self.db.get_daily_word_for_user(user_id, today)
-                image = word_image(word) if word is not None else ""
-                if image:
-                    urls.append(image)
+                if word is not None:
+                    urls.extend(word_images(word))  # 여러 장이면 모두 (스토리보드 재료)
             if not urls:
                 log.info("🖼️ 오늘의 수어 사진 미리 받기 (%s): 받을 사진 없음 (최근 유저 %d명)", today, len(user_ids))
                 return
@@ -892,7 +896,7 @@ class SignLanguage(commands.Cog, name="수어"):
         embed.set_footer(
             text=f"{today:%Y년 %m월 %d일} · {interaction.user.display_name} 님의 오늘 단어예요 🤟"
         )
-        photo = await self.photos.attach(embed)
+        photo = await self.photos.attach(embed, word_images(word))
         await send_with_media_fallback(
             interaction.followup.send,
             embed=embed, view=word_link_view(word), photo=photo, content=content,
@@ -952,7 +956,7 @@ class SignLanguage(commands.Cog, name="수어"):
             )
             embed.description = f"{conditions} 으로 찾은 결과예요."
             embed.set_footer(text="다른 단어도 찾아볼까요? /수어검색 🤟")
-            photo = await self.photos.attach(embed)
+            photo = await self.photos.attach(embed, word_images(word))
             await send_with_media_fallback(
                 interaction.followup.send,
                 embed=embed, view=word_link_view(word), photo=photo, content=content,
@@ -1061,7 +1065,7 @@ class SignLanguage(commands.Cog, name="수어"):
         )
 
         # 사진은 처음 보낼 때 첨부 파일로 올리고, 채점 화면으로 고칠 때는 그 파일이 그대로 남습니다.
-        photo = await self.photos.attach(embed)
+        photo = await self.photos.attach(embed, word_images(answer))
         view = SignQuizView(self.db, interaction.user, answer, choices, embed, is_review=is_review)
         # wait=True 를 줘야 메시지 객체가 돌아옵니다 (시간 초과 시 수정에 필요)
         # ephemeral=True 로 보내도 채점 화면까지 계속 비공개로 유지됩니다.
@@ -1188,7 +1192,7 @@ class SignLanguage(commands.Cog, name="수어"):
         )
         embed.color = COLOR_NOTES
 
-        photo = await self.photos.attach(embed)
+        photo = await self.photos.attach(embed, word_images(answer))
         view = ReviewQuizView(self.db, interaction.user, answer, choices, embed)
         # /수어퀴즈 와 같은 이유로 ephemeral + wait=True (시간 초과 때 같은 비공개 메시지를 고침)
         view.message = await send_with_media_fallback(

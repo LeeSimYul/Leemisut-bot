@@ -6,3 +6,6 @@ aiohttp>=3.9
 # 클라우드 PostgreSQL(Supabase · Neon) 연결용.
 # .env 에 DATABASE_URL 이 없으면 쓰이지 않으므로, 로컬 SQLite 만 쓸 때도 설치해 두면 됩니다.
 asyncpg>=0.30
+
+# 수형 이미지 여러 장을 한 장(스토리보드)으로 이어 붙일 때 씁니다. (없으면 첫 장만 보냅니다)
+Pillow>=10.1
