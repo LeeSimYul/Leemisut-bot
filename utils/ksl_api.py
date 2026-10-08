@@ -15,9 +15,10 @@ utils/ksl_api.py
     fetch_all_sign_words()          → 전체 데이터를 페이지 순회로 수집
     KSLApiError                     → 이 모듈이 던지는 모든 오류의 상위 클래스
 
-    세 함수 모두 [(word_name, meaning, video_url, image_url, category, detail_url, image_urls), ...]
+    세 함수 모두 [(word_name, meaning, video_url, image_url, category, detail_url, image_urls, aliases), ...]
     형태를 돌려줍니다. database.sync_api_words() 에 그대로 넣으시면 됩니다.
     (image_urls 는 signImages 의 수형 이미지 전체를 줄바꿈으로 이은 문자열)
+    (aliases 는 표제어에 함께 적힌 다른 이름 · '고맙다,감사' 의 '감사' · 를 줄바꿈으로 이은 문자열)
 """
 from __future__ import annotations
 
@@ -52,6 +53,7 @@ __all__ = [
     # 클라이언트 및 유틸
     "KSLApiClient",
     "normalize_word_name",
+    "word_aliases",
     "normalize_meaning",
     "evaluate_word",
     "filter_words",
@@ -189,11 +191,43 @@ def normalize_word_name(raw: str) -> str:
     """
     if not raw:
         return ""
+    return _clean_name_part(_split_title(raw)[0])  # 쉼표·가운뎃점 앞의 대표 단어만 사용
 
-    name = _HTML_TAG.sub("", str(raw))
-    name = _PAREN.sub("", name)          # 괄호 안 부연 설명 제거
-    name = _SPLIT_CHARS.split(name)[0]   # 쉼표·가운뎃점 앞의 대표 단어만 사용
-    name = name.strip()
+
+def word_aliases(raw: str) -> tuple[str, ...]:
+    """
+    표제어에 함께 적힌 다른 이름(동의어)들. 대표 단어(normalize_word_name)는 빼고 돌려줍니다.
+    수어사전은 수어 하나에 한국어 낱말 여러 개를 쉼표로 묶어 두는 경우가 많아,
+    '감사'로도 '고맙다,감사' 단어를 찾을 수 있게 따로 저장합니다. (sign_words.aliases)
+
+    >>> word_aliases("고맙다,감사, 사례01")
+    ('감사', '사례')
+    >>> word_aliases("사랑, -애")
+    ()
+    """
+    if not raw:
+        return ()
+    name = normalize_word_name(raw)
+    aliases: list[str] = []
+    for part in _split_title(raw)[1:]:
+        if part.strip().startswith(("-", "–", "—")):
+            continue  # '-애' 같은 접사 표시는 낱말이 아닙니다
+        alias = _clean_name_part(part)
+        if (alias and alias != name and alias not in aliases
+                and not INVALID_CHARS.search(alias) and len(alias) <= MAX_WORD_LENGTH):
+            aliases.append(alias)
+    return tuple(aliases)
+
+
+def _split_title(raw: str) -> list[str]:
+    """HTML 태그 · 괄호 안 부연 설명을 지우고 쉼표 · 가운뎃점 등으로 나눕니다."""
+    text = _HTML_TAG.sub("", str(raw))
+    text = _PAREN.sub("", text)
+    return _SPLIT_CHARS.split(text)
+
+
+def _clean_name_part(part: str) -> str:
+    name = part.strip()
     name = name.strip("-–—‘’“”\"'`.^*")  # 접사 표시(-애) 및 따옴표 제거
     # 동형어 번호(사랑01, 사랑02)만 제거합니다. 앞자리가 0인 두 자리 숫자만 대상이라
     # 코로나19·G20·119 같은 이름은 그대로 남습니다.
@@ -234,13 +268,14 @@ class SignWord:
     image_url: str = ""   # 수형 사진 대표 1장 (예전 데이터 호환용)
     detail_url: str = ""  # 사전 상세 페이지 (정답이 보이므로 퀴즈 중에는 숨김)
     image_urls: tuple[str, ...] = ()  # 수형 이미지 전체 (signImages n건 · 순서 유지)
+    aliases: tuple[str, ...] = ()     # 표제어에 함께 적힌 다른 이름 (고맙다,감사 → 감사)
 
-    def as_row(self) -> tuple[str, str, str, str, str, str, str]:
+    def as_row(self) -> tuple[str, str, str, str, str, str, str, str]:
         """database.sync_api_words() 가 받는 튜플 형태로 변환합니다."""
         return (
             self.word_name, self.meaning, self.video_url,
             self.image_url, self.category, self.detail_url,
-            "\n".join(self.image_urls),
+            "\n".join(self.image_urls), "\n".join(self.aliases),
         )
 
 
@@ -309,6 +344,7 @@ def evaluate_word(item: dict[str, Any], keyword: str = "") -> SignWord | Rejecte
         image_url=pick_image_url(item),
         detail_url=pick_detail_url(item),
         image_urls=pick_image_urls(item),
+        aliases=word_aliases(raw_name),
     )
 
 

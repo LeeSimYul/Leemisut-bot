@@ -6,7 +6,7 @@ cogs/general.py
 /내정보 는 레벨 · 경험치 · 포인트 · 연속 출석 · 단어장 개수 · 오늘의 보상 현황을 한눈에 보여 줍니다.
 
 ※ 예전 /명언 · /격언 은 /문장수어 (cogs/sentences.py)로 합쳤습니다.
-   문장 · 모범 수어문은 utils/sentence_seed.py 에서 관리합니다.
+   문장 · 참고 예시 수어문은 utils/sentence_seed.py 에서 관리합니다.
 """
 from __future__ import annotations
 

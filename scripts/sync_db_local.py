@@ -9,7 +9,7 @@ scripts/sync_db_local.py
 ■ 봇 명령어와 같은 코드를 씁니다
     - 수집 · 검증 : utils.ksl_api.fetch_all_sign_words  (/수어전체동기화 와 같은 필터)
     - 저장       : Database.sync_api_words           (/수어전체동기화 와 같은 저장 방식)
-    같은 단어 · 같은 영상이면 같은 행을 갱신합니다. (설명 · 대표 사진 · 분류 · 사전 주소 · 수형 이미지 목록)
+    같은 단어 · 같은 영상이면 같은 행을 갱신합니다. (설명 · 대표 사진 · 분류 · 사전 주소 · 수형 이미지 목록 · 다른 이름)
     새 단어는 추가하고, 유저 포인트 · 출석 · 퀴즈 기록 · 단어장 · 오답노트는 건드리지 않습니다.
     수형 이미지 목록(image_urls)은 봇이 읽는 형식 그대로 '줄바꿈으로 구분한 주소'로 저장합니다.
 
@@ -86,9 +86,12 @@ def draw_progress(page_no: int, collected: int, total: int, started: float) -> N
 
 def summarize_changes(rows: list[tuple[str, ...]], existing: dict[tuple[str, str], tuple[str, str]]) -> dict[str, int]:
     """받은 단어를 운영 DB 와 비교합니다. (저장하기 전 미리보기)"""
-    stats = {"matched": 0, "new": 0, "image_changed": 0, "to_illustration": 0, "with_list": 0, "multi": 0}
+    stats = {"matched": 0, "new": 0, "image_changed": 0, "to_illustration": 0, "with_list": 0, "multi": 0,
+             "with_aliases": 0}
     for row in rows:
         name, video, image_url, image_urls = row[0], row[2], row[3], row[6]
+        if len(row) > 7 and row[7]:
+            stats["with_aliases"] += 1
         if image_urls:
             stats["with_list"] += 1
             if len(image_urls.splitlines()) >= 2:
@@ -146,6 +149,7 @@ async def main() -> int:
         print("🔎 운영 DB 와 비교")
         print(f"   기존 단어와 같은 행(갱신) {s['matched']}개 · 새 단어(추가) {s['new']}개")
         print(f"   수형 이미지 목록 {s['with_list']}개 (여러 장 {s['multi']}개)")
+        print(f"   다른 이름(동의어)이 있는 단어 {s['with_aliases']}개 (/문장수어 단어 찾기에 씀)")
         print(f"   대표 사진이 바뀌는 단어 {s['image_changed']}개 (영상 캡처 → 삽화 {s['to_illustration']}개)")
         if existing and s["new"] > max(50, len(existing) * NEW_WORDS_WARN_RATIO):
             print(
@@ -170,6 +174,7 @@ async def main() -> int:
         with_lists = await db.count_words_with_image_urls()
         print(f"✅ 저장 완료: 새로 추가 {added}개 · 갱신 {len(rows) - added}개 → 전체 단어 {total}개")
         print(f"🖼️ 수형 이미지 목록이 있는 단어: {before_lists}개 → {with_lists}개")
+        print(f"🔤 다른 이름(동의어)이 있는 단어: {await db.count_words_with_aliases()}개")
         print("👉 다음: VM 에서 봇을 다시 시작하고, 새 삽화를 미리 받아 두세요.")
         print("   sudo systemctl restart leemisut && venv/bin/python scripts/bulk_download_images.py --no-archive")
         return 0

@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS sign_words (
     category   TEXT NOT NULL DEFAULT '일반',
     detail_url TEXT NOT NULL DEFAULT '',
     image_urls TEXT NOT NULL DEFAULT '',   -- 수형 이미지 전체 (API signImages · 줄바꿈 구분)
+    aliases    TEXT NOT NULL DEFAULT '',   -- 표제어에 함께 적힌 다른 이름 (고맙다,감사 → 감사 · 줄바꿈 구분)
     CONSTRAINT sign_words_name_video_key UNIQUE (word_name, video_url)
 );
 
@@ -83,7 +84,7 @@ CREATE TABLE IF NOT EXISTS sign_sentences (
     id               BIGINT   PRIMARY KEY,
     category         TEXT     NOT NULL,              -- 속담 · 명언 · 일상회화 · VRChat
     korean_text      TEXT     NOT NULL,              -- 한국어 원문
-    ksl_gloss        TEXT     NOT NULL,              -- 모범 수어문 (글로스 · 절은 ' / ' 로 구분)
+    ksl_gloss        TEXT     NOT NULL,              -- 참고 예시 수어문 (글로스 · 절은 ' / ' 로 구분)
     translation_tip  TEXT     NOT NULL DEFAULT '',   -- 표현 꿀팁 · 비수지 신호
     difficulty       SMALLINT NOT NULL DEFAULT 1,    -- 1 입문 · 2 초급 · 3 중급
     source           TEXT     NOT NULL DEFAULT '',   -- 출처

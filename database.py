@@ -27,6 +27,7 @@ database.py
     video_url  동영상 파일 주소
     image_url  수형 사진 주소 (대표 1장 · 예전 데이터 호환용)
     image_urls 수형 이미지 주소 전체 (API signImages 의 n건 · 줄바꿈으로 구분 · 비어 있으면 image_url 만 씀)
+    aliases    표제어에 함께 적힌 다른 이름 (고맙다,감사 → 감사 · 줄바꿈으로 구분) - /문장수어 단어 찾기에 씀
     category   분류항목
     detail_url 사전 상세 페이지 (퀴즈 중에는 숨김)
     UNIQUE(word_name, video_url)
@@ -45,7 +46,7 @@ database.py
     id               문장 번호 (PK · utils/sentence_seed.py 의 번호 그대로 · 자동 증가 아님)
     category         속담 · 명언 · 일상회화 · VRChat
     korean_text      한국어 원문
-    ksl_gloss        모범 수어문 (글로스 · 단어 단위 띄어쓰기 · 절은 ' / ' 로 구분)
+    ksl_gloss        참고 예시 수어문 (글로스 · 단어 단위 띄어쓰기 · 절은 ' / ' 로 구분 · 정답이 아님)
     translation_tip  표현 꿀팁 · 비수지 신호(표정 · 고개 · 시선) 안내
     difficulty       난이도 1 입문 · 2 초급 · 3 중급
     source           출처 (우리 속담 · 헬렌 켈러 …)
@@ -115,7 +116,9 @@ CONNECT_RETRIES = 3          # Neon 등은 절전에서 깨어나며 첫 연결�
 CONNECT_RETRY_DELAY = 2.0    # 초
 
 # 저장할 컬럼 순서 (튜플 순서와 동일하게 유지해 주세요)
-COLUMNS = ("word_name", "meaning", "video_url", "image_url", "category", "detail_url", "image_urls")
+COLUMNS = (
+    "word_name", "meaning", "video_url", "image_url", "category", "detail_url", "image_urls", "aliases",
+)
 
 # 초기 테스트용 더미 데이터 (word_name, meaning, video_url, image_url, category, detail_url)
 # ⚠️ /수어전체동기화 를 하면 실제 자료로 채워집니다.
@@ -154,6 +157,7 @@ SQLITE_SCHEMA: tuple[str, ...] = (
         category   TEXT    NOT NULL DEFAULT '일반',
         detail_url TEXT    NOT NULL DEFAULT '',
         image_urls TEXT    NOT NULL DEFAULT '',      -- 수형 이미지 전체 (줄바꿈 구분)
+        aliases    TEXT    NOT NULL DEFAULT '',      -- 다른 이름 (동의어 · 줄바꿈 구분)
         UNIQUE(word_name, video_url)                 -- 같은 단어라도 영상이 다르면 별개
     )
     """,
@@ -202,7 +206,7 @@ SQLITE_SCHEMA: tuple[str, ...] = (
         id               INTEGER PRIMARY KEY,           -- 시드 파일의 문장 번호
         category         TEXT    NOT NULL,              -- 속담 · 명언 · 일상회화 · VRChat
         korean_text      TEXT    NOT NULL,              -- 한국어 원문
-        ksl_gloss        TEXT    NOT NULL,              -- 모범 수어문 (글로스)
+        ksl_gloss        TEXT    NOT NULL,              -- 참고 예시 수어문 (글로스)
         translation_tip  TEXT    NOT NULL DEFAULT '',   -- 표현 꿀팁 · 비수지 신호
         difficulty       INTEGER NOT NULL DEFAULT 1,    -- 1 입문 · 2 초급 · 3 중급
         source           TEXT    NOT NULL DEFAULT '',   -- 출처
@@ -248,6 +252,7 @@ POSTGRES_SCHEMA: tuple[str, ...] = (
         category   TEXT NOT NULL DEFAULT '일반',
         detail_url TEXT NOT NULL DEFAULT '',
         image_urls TEXT NOT NULL DEFAULT '',
+        aliases    TEXT NOT NULL DEFAULT '',
         CONSTRAINT sign_words_name_video_key UNIQUE (word_name, video_url)
     )
     """,
@@ -852,6 +857,7 @@ class Database:
         await self.backend.execute_script(self.backend.schema)
         await self._migrate_sqlite_legacy()
         await self._migrate_image_urls()
+        await self._migrate_aliases()
         await self._migrate_quiz_notes()
 
         if self.seed_mock and await self.count_words() == 0:
@@ -940,21 +946,32 @@ class Database:
         sign_words 에 image_urls(수형 이미지 전체) 컬럼이 없으면 추가합니다. (SQLite · PostgreSQL 공통)
         기존 단어는 빈 값이라 대표 사진(image_url) 1장만 쓰다가, /수어전체동기화 를 하면 채워집니다.
         """
+        if await self._add_text_column_if_missing("sign_words", "image_urls"):
+            log.info("🖼️ sign_words 에 image_urls(수형 이미지 전체) 컬럼을 추가했습니다. (/수어전체동기화 로 채워짐)")
+
+    async def _migrate_aliases(self) -> None:
+        """
+        sign_words 에 aliases(다른 이름 · 동의어) 컬럼이 없으면 추가합니다. (SQLite · PostgreSQL 공통)
+        기존 단어는 빈 값이라 대표 단어명으로만 찾다가, 전체 동기화를 하면 채워집니다.
+        """
+        if await self._add_text_column_if_missing("sign_words", "aliases"):
+            log.info("🔤 sign_words 에 aliases(다른 이름) 컬럼을 추가했습니다. (전체 동기화로 채워짐)")
+
+    async def _add_text_column_if_missing(self, table: str, column: str) -> bool:
+        """TEXT NOT NULL DEFAULT '' 컬럼을 없을 때만 추가합니다. 반환: 새로 추가했는지"""
         if isinstance(self.backend, SQLiteBackend):
-            rows = await self.backend.fetch_all("PRAGMA table_info(sign_words)")
-            exists = "image_urls" in {row[1] for row in rows}
+            rows = await self.backend.fetch_all(f"PRAGMA table_info({table})")
+            exists = column in {row[1] for row in rows}
         else:
             row = await self.backend.fetch_one(
                 "SELECT COUNT(*) AS cnt FROM information_schema.columns "
-                "WHERE table_schema = current_schema() "
-                "AND table_name = 'sign_words' AND column_name = 'image_urls'"
+                "WHERE table_schema = current_schema() AND table_name = ?::text AND column_name = ?::text",
+                (table, column),
             )
             exists = bool(row and int(row["cnt"]))
         if not exists:
-            await self.backend.execute(
-                "ALTER TABLE sign_words ADD COLUMN image_urls TEXT NOT NULL DEFAULT ''"
-            )
-            log.info("🖼️ sign_words 에 image_urls(수형 이미지 전체) 컬럼을 추가했습니다. (/수어전체동기화 로 채워짐)")
+            await self.backend.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+        return not exists
 
     async def _migrate_quiz_notes(self) -> None:
         """
@@ -1022,6 +1039,11 @@ class Database:
             log.info("📒 오답노트 이전: 기존 퀴즈 기록에서 %d개 단어를 옮겼습니다.", moved)
 
     # ── 인메모리 캐시 ────────────────────────────────────────────
+    @property
+    def data_version(self) -> int:
+        """단어가 추가 · 수정 · 삭제될 때마다 커지는 번호. 바깥 캐시(단어 색인 등)가 새로 읽을 때를 알려 줍니다."""
+        return self._cache_generation
+
     def _invalidate_cache(self) -> None:
         """단어가 추가/수정/삭제된 뒤 호출합니다. 다음 조회 때 DB에서 새로 채웁니다."""
         self._cache.clear()
@@ -1063,6 +1085,13 @@ class Database:
         """수형 사진 주소(image_url)가 저장된 단어 수. (봇 시작 로그에서 사진 수집 상태 확인용)"""
         row = await self.backend.fetch_one(
             "SELECT COUNT(*) AS cnt FROM sign_words WHERE image_url <> ''"
+        )
+        return int(row["cnt"]) if row else 0
+
+    async def count_words_with_aliases(self) -> int:
+        """다른 이름(동의어)이 저장된 단어 수. (0 이면 아직 전체 동기화 전)"""
+        row = await self.backend.fetch_one(
+            "SELECT COUNT(*) AS cnt FROM sign_words WHERE aliases <> ''"
         )
         return int(row["cnt"]) if row else 0
 
@@ -1283,7 +1312,7 @@ class Database:
     async def sync_api_words(self, words_data: list[tuple[str, ...]]) -> int:
         """
         API에서 받아 온 단어들을 저장합니다.
-        (word_name, meaning, video_url[, image_url, category, detail_url[, image_urls]]) 형태를 모두 받습니다.
+        (word_name, meaning, video_url[, image_url, category, detail_url[, image_urls[, aliases]]]) 형태를 모두 받습니다.
 
         중복 판정은 (word_name, video_url) 복합 기준입니다.
         같은 단어라도 영상이 다르면 동음이의어로 보고 따로 저장하고,
@@ -1301,7 +1330,7 @@ class Database:
                 row = (row[0], row[1], row[2], "", row[3], "")
             elif len(row) == 5:  # (name, meaning, video, category, detail)
                 row = (row[0], row[1], row[2], "", row[3], row[4])
-            rows.append(row + ("",) * (7 - len(row)))
+            rows.append(row + ("",) * (8 - len(row)))
 
         before = await self.count_words()
         try:
@@ -1309,14 +1338,16 @@ class Database:
                 await self.backend.execute_many(
                     """
                     INSERT INTO sign_words
-                        (word_name, meaning, video_url, image_url, category, detail_url, image_urls)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                        (word_name, meaning, video_url, image_url, category, detail_url,
+                         image_urls, aliases)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (word_name, video_url) DO UPDATE SET
                         meaning    = excluded.meaning,
                         image_url  = excluded.image_url,
                         category   = excluded.category,
                         detail_url = excluded.detail_url,
-                        image_urls = excluded.image_urls
+                        image_urls = excluded.image_urls,
+                        aliases    = excluded.aliases
                     """,
                     rows,
                 )
@@ -1749,23 +1780,14 @@ class Database:
             "SELECT * FROM sign_sentences WHERE id = ?", (sentence_id,)
         )
 
-    async def find_word_ids_by_names(self, names: Sequence[str]) -> dict[str, list[int]]:
+    async def get_word_names(self) -> list[Row]:
         """
-        단어명 → word_id 목록. 동음이의어(같은 이름 · 다른 영상)가 있으면 모두 담습니다. (작은 ID 부터)
-        사전에 없는 단어명은 결과에 들어가지 않습니다.
+        전체 단어의 (word_id, word_name, aliases). /문장수어 가 단어명 · 다른 이름으로 단어를 찾는
+        메모리 색인(utils/word_index.py)을 만들 때 씁니다. (약 3,700건 · 짧은 글자만)
         """
-        unique = list(dict.fromkeys(name for name in names if name))
-        found: dict[str, list[int]] = {}
-        for start in range(0, len(unique), 500):  # SQLite 자리표시자 개수 제한을 넉넉히 피합니다
-            chunk = unique[start:start + 500]
-            rows = await self.backend.fetch_all(
-                "SELECT word_id, word_name FROM sign_words "
-                f"WHERE word_name IN ({', '.join('?' * len(chunk))}) ORDER BY word_id",
-                chunk,
-            )
-            for row in rows:
-                found.setdefault(row["word_name"], []).append(int(row["word_id"]))
-        return found
+        return await self.backend.fetch_all(
+            "SELECT word_id, word_name, aliases FROM sign_words ORDER BY word_id"
+        )
 
     async def get_words_by_ids(self, word_ids: Sequence[int]) -> list[Row]:
         """word_id 목록의 단어를 그 순서대로 돌려줍니다. (사전에서 지워진 단어는 빠집니다)"""

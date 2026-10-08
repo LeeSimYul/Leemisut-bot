@@ -7,17 +7,21 @@ cogs/sentences.py
   2. 카드 아래 버튼 · 메뉴 (누구나 누를 수 있습니다)
      [✍️ 내 수어문 작성하기]  모달 창에 수어 어순을 적어 제출 → 카드에서 열린 공개 스레드에 올라갑니다.
                                그날(KST) 첫 제출이면 포인트 · 경험치를 줍니다. (utils/rewards.py)
-                               제출한 사람에게는 모범 어순을 함께 보여 줘 바로 비교해 볼 수 있게 합니다.
-     [💡 모범 수어 어순 보기]  모범 수어문(글로스)과 표현 팁을 누른 사람에게만 보여 줍니다.
+                               제출한 사람에게는 참고 예시를 나란히 보여 주고, 수어문에서 찾은 사전 단어를
+                               '🔎 내가 쓴 단어 수형 확인하기' 메뉴로 열어 볼 수 있게 합니다. (utils/word_index.py)
+     [💡 참고용 예시 어순 보기]  참고 예시 수어문(글로스)과 표현 팁을 누른 사람에게만 보여 줍니다.
      [📚 관련 단어 수형 보기]  (선택 메뉴) 고른 단어의 수형 삽화 · 설명 카드를 누른 사람에게만 보여 줍니다.
                                단어 카드는 cogs/sign_language.py 의 send_word_card 로 그립니다.
-  3. 다른 학생들도 스레드에 자유롭게 댓글을 달며 토론합니다.
+  3. 다른 학생들도 스레드에 자유롭게 댓글을 달며 토론합니다. 스레드 첫 메시지가 토론 화두를 던집니다.
+
+■ 어조: 수어는 맥락 · 위치에 따라 여러 표현이 가능한 언어라 '정답 · 모범' 대신 '참고 예시'라고 부릅니다.
 
 ■ /명언 · /격언 은 이 명령어로 합쳤습니다. (예전 명언 · 사자성어도 '격언 · 명언' 갈래에 옮겨 두었습니다)
 ■ 봇이 다시 켜져도 예전 카드의 버튼이 동작합니다.
    custom_id 에 문장 번호를 넣고(sentence:write:12), discord.ui.DynamicItem 으로 받아 처리합니다.
 ■ 문장은 봇이 켜질 때 utils/sentence_seed.py 의 내용으로 DB(sign_sentences)를 맞추고 메모리에 들고 씁니다.
-   관련 단어는 시드의 단어명을 이 DB 의 word_id 로 바꿔 넣습니다. 사전에 없는 단어명은 시작 로그로 알려 줍니다.
+   관련 단어는 시드의 단어명을 이 DB 의 word_id 로 바꿔 넣습니다. (대표 이름 · 다른 이름 · '하다' 형태로 찾음)
+   사전에 없는 단어명은 시작 로그로 알려 줍니다.
    (/수어전체동기화 로 단어가 바뀌었다면 봇을 다시 켜면 관련 단어도 다시 연결됩니다)
 ■ 스레드
    - 처음 제출할 때 카드 메시지에서 공개 스레드('💬 수어 토론: …')를 열고, 다음 제출부터는 그 스레드에 올립니다.
@@ -29,14 +33,15 @@ cogs/sentences.py
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import json
 import logging
 import random
 import re
 import time
-from datetime import date, datetime, timedelta, timezone
 from collections.abc import Iterable
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import discord
@@ -46,6 +51,7 @@ from discord.ext import commands
 from database import Database, Row
 from utils.rewards import SENTENCE_EXP, SENTENCE_POINTS
 from utils.sentence_seed import SEED_SENTENCES
+from utils.word_index import WordIndex, WordMatch
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +68,8 @@ SUBMISSION_MIN_LENGTH = 2
 SUBMISSION_MAX_LENGTH = 300
 SUBMISSION_MAX_LINES = 6
 MODAL_TIMEOUT = 3600.0       # 초 - 모달 창을 열어 둔 채 기다려 주는 최대 시간
+MY_WORDS_TIMEOUT = 600.0     # 초 - 제출 뒤 '내가 쓴 단어' 메뉴를 쓸 수 있는 시간 (상호작용 토큰 15분 안)
+MISSING_TERMS_SHOWN = 8      # 찾지 못한 낱말을 몇 개까지 보여 줄지
 THREAD_AUTO_ARCHIVE = 10080  # 분 (7일) - 대화가 없으면 이만큼 뒤 스레드가 보관됩니다 (제출하면 다시 열림)
 THREAD_NAME_PREFIX = "💬 수어 토론: "
 THREAD_NAME_LIMIT = 100      # 디스코드 스레드 이름 최대 길이
@@ -81,10 +89,34 @@ CATEGORY_META: dict[str, tuple[str, str, discord.Color]] = {
 }
 DIFFICULTY_LABELS = {1: "⭐ 입문", 2: "⭐⭐ 초급", 3: "⭐⭐⭐ 중급"}
 GUIDE_TEXT = (
-    "① 문장의 **핵심 단어**를 고르고\n"
-    "② **시간 → 장소 → 주제 → 행동** 순서로 놓고 (의문사 · 부정은 끝으로)\n"
-    "③ 질문 · 부정 · 강조는 **표정과 고개**로 더해 보세요!"
+    "① 문장의 **핵심 단어**를 골라 보고\n"
+    "② 흔히 **시간 → 장소 → 주제 → 행동** 순으로 놓아요 (의문사 · 부정은 끝에 오는 경우가 많아요)\n"
+    "③ 질문 · 부정 · 정도는 **표정과 고개**로 더해 보세요\n"
+    "🌈 정답은 하나가 아니에요. 내가 떠올린 표현을 자유롭게 나눠 주세요!"
 )
+GLOSS_FOOTER = (
+    "💡 수어는 상황과 맥락, 상대방과의 위치에 따라 다양한 표현이 존중되는 언어예요. "
+    "여기에 제시된 어순은 단지 하나의 참고용 예시일 뿐이니, "
+    "여러분의 다양한 생각과 표현을 스레드에서 자유롭게 나눠보세요!"
+)
+# 스레드가 처음 열릴 때 던지는 토론 화두 (discussion_intro)
+DISCUSSION_OPENING = (
+    "💬 **수어 토론방**이 열렸어요! 정답을 맞히는 곳이 아니라 서로의 표현을 나누는 곳이에요.\n"
+    "🤔 이 문장에서 어떤 단어를 가장 먼저 보여 주면 좋을까요? "
+    "표정(비수지 신호)이나 손동작 크기로 강조하는 방법도 함께 댓글로 이야기해 보세요 🤟"
+)
+DISCUSSION_CLOSING = "카드의 **[✍️ 내 수어문 작성하기]** 로 내 어순을 올리거나, 여기에 바로 댓글을 남겨도 좋아요."
+QUESTION_WORDS = ("무엇", "어디", "누구", "언제", "왜", "어떻게", "몇", "얼마")
+NEGATION_WORDS = ("아니다", "없다", "못하다", "안", "않다", "안되다")
+QUESTION_PROMPT_WH = "❓ 의문사가 들어간 질문이에요. 의문사를 어디에 두고 어떤 표정으로 물어보면 자연스러울까요?"
+QUESTION_PROMPT_YN = "❓ 예/아니오로 답하는 질문이에요. 눈썹과 턱의 움직임으로 질문을 어떻게 나타낼 수 있을까요?"
+NEGATION_PROMPT = "🙅 부정 표현이 들어 있어요. 고개를 좌우로 흔드는 동작은 어느 단어와 함께하면 좋을까요?"
+CATEGORY_PROMPTS = {
+    "속담": "🧓 속담은 글자 그대로 옮길 수도, 숨은 뜻을 풀어 옮길 수도 있어요. 어느 쪽이 더 잘 전해질까요?",
+    "명언": "💡 이 말을 한 사람의 마음까지 전하려면 손동작의 속도와 표정을 어떻게 맞추면 좋을까요?",
+    "일상회화": "☕ 실제 대화라면 어떤 상황에서 쓰게 될까요? 상황에 따라 표현이 달라지는지도 이야기해 봐요.",
+    "VRChat": "🥽 VR 에서는 손이 인식되는 범위가 정해져 있어요. 손동작의 위치와 크기를 어떻게 하면 잘 보일까요?",
+}
 CIRCLED_NUMBERS = "①②③④⑤⑥⑦⑧⑨"
 
 
@@ -131,6 +163,19 @@ def format_gloss(gloss: str) -> str:
         mark = CIRCLED_NUMBERS[index] if len(clauses) > 1 and index < len(CIRCLED_NUMBERS) else ""
         lines.append(f"**{mark}** {words}" if mark else words)
     return "\n".join(lines) or "-"
+
+
+def discussion_intro(sentence: Row) -> str:
+    """스레드 첫 메시지. 공통 화두 + 문장 특성(질문 · 부정 · 갈래)에 맞춘 질문 하나."""
+    gloss_words = [word.rstrip("?") for word in sentence["ksl_gloss"].replace("/", " ").split()]
+    is_question = sentence["korean_text"].rstrip().endswith("?") or sentence["ksl_gloss"].rstrip().endswith("?")
+    if is_question:
+        extra = QUESTION_PROMPT_WH if any(w in QUESTION_WORDS for w in gloss_words) else QUESTION_PROMPT_YN
+    elif any(w in NEGATION_WORDS for w in gloss_words):
+        extra = NEGATION_PROMPT
+    else:
+        extra = CATEGORY_PROMPTS.get(sentence["category"], "")
+    return "\n".join(part for part in (DISCUSSION_OPENING, extra, DISCUSSION_CLOSING) if part)
 
 
 def thread_name(sentence: Row) -> str:
@@ -183,24 +228,24 @@ def build_sentence_embed(sentence: Row, words: list[Row]) -> discord.Embed:
         ),
         inline=False,
     )
-    embed.set_footer(text=f"문장 #{sentence['id']} · 💡 모범 어순은 버튼을 누른 사람에게만 보여요")
+    embed.set_footer(text=f"문장 #{sentence['id']} · 💡 참고 예시는 버튼을 누른 사람에게만 보여요")
     return embed
 
 
 def build_gloss_embed(sentence: Row, *, mine: str = "") -> discord.Embed:
-    """모범 수어 어순 (본인에게만). mine 이 있으면 내 수어문을 위에 함께 보여 줍니다."""
+    """참고용 예시 어순 (본인에게만). mine 이 있으면 내 수어문을 위에 함께 보여 줍니다."""
     _, _, color = category_meta(sentence["category"])
     embed = discord.Embed(
-        title="💡 모범 수어 어순", description=f"> {sentence['korean_text']}", color=color
+        title="💡 참고용 예시 어순", description=f"> {sentence['korean_text']}", color=color
     )
     if mine:
         embed.add_field(name="✍️ 내 수어문", value=safe_text(mine), inline=False)
-    embed.add_field(name="🤟 모범 수어문 (글로스)", value=format_gloss(sentence["ksl_gloss"]), inline=False)
+    embed.add_field(name="🤟 하나의 참고 예시 (글로스)", value=format_gloss(sentence["ksl_gloss"]), inline=False)
     if sentence["translation_tip"]:
         embed.add_field(
             name="🙂 표현 팁 · 비수지 신호", value=truncate(sentence["translation_tip"], 1024), inline=False
         )
-    embed.set_footer(text="모범 어순은 하나의 예시예요. 지역 · 사람마다 다른 표현도 있어요 🤟")
+    embed.set_footer(text=GLOSS_FOOTER)
     return embed
 
 
@@ -278,12 +323,12 @@ class WriteButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sentence
 
 
 class GlossButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sentence:gloss:(?P<id>\d+)"):
-    """[💡 모범 수어 어순 보기] → 나에게만"""
+    """[💡 참고용 예시 어순 보기] → 나에게만 (custom_id 는 예전 카드와 같아 예전 버튼도 그대로 동작)"""
 
     def __init__(self, sentence_id: int) -> None:
         super().__init__(
             discord.ui.Button(
-                label="모범 수어 어순 보기",
+                label="참고용 예시 어순 보기",
                 emoji="💡",
                 style=discord.ButtonStyle.secondary,
                 custom_id=f"sentence:gloss:{sentence_id}",
@@ -301,7 +346,7 @@ class GlossButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sentence
     async def callback(self, interaction: discord.Interaction) -> None:
         cog = sentences_cog(interaction)
         if cog is not None:
-            await run_safely(interaction, "모범 어순", cog.show_gloss(interaction, self.sentence_id))
+            await run_safely(interaction, "참고 예시", cog.show_gloss(interaction, self.sentence_id))
 
 
 class WordSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"sentence:word:(?P<id>\d+)"):
@@ -380,6 +425,43 @@ class SubmissionModal(discord.ui.Modal):
         await send_error(interaction)
 
 
+class MyWordsView(discord.ui.View):
+    """
+    제출 완료 메시지(나에게만)의 '🔎 내가 쓴 단어 수형 확인하기' 메뉴.
+    고르면 그 단어의 수형 삽화 카드가 나에게만 열립니다. MY_WORDS_TIMEOUT 뒤 메뉴를 거둡니다.
+    """
+
+    def __init__(self, cog: Sentences, matches: list[WordMatch], words: dict[int, Row]) -> None:
+        super().__init__(timeout=MY_WORDS_TIMEOUT)
+        self.cog = cog
+        self.matches = {m.word_id: m for m in matches}
+        self.message: discord.WebhookMessage | None = None
+        self.select: discord.ui.Select[MyWordsView] = discord.ui.Select(
+            placeholder="🔎 내가 쓴 단어 수형 확인하기",
+            options=[
+                discord.SelectOption(
+                    label=truncate(m.label, 100),
+                    value=str(m.word_id),
+                    description=word_summary(words[m.word_id]) if m.word_id in words else None,
+                    emoji="🔎",
+                )
+                for m in matches[:25]
+            ],
+        )
+        self.select.callback = self._on_select  # type: ignore[method-assign]
+        self.add_item(self.select)
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        match = self.matches.get(int(self.select.values[0]))
+        if match is not None:
+            await run_safely(interaction, "내가 쓴 단어", self.cog.show_my_word(interaction, match, self))
+
+    async def on_timeout(self) -> None:
+        if self.message is not None:
+            with contextlib.suppress(discord.HTTPException):
+                await self.message.edit(view=None)
+
+
 # ── Cog ─────────────────────────────────────────────────────────
 class Sentences(commands.Cog, name=COG_NAME):
     def __init__(self, bot: commands.Bot, db: Database) -> None:
@@ -389,6 +471,8 @@ class Sentences(commands.Cog, name=COG_NAME):
         self._last_shown: dict[int, int] = {}      # 채널별 직전 문장 (두 번 연속 같은 문장 방지)
         self._last_submit: dict[int, float] = {}   # 유저별 마지막 제출 시각 (도배 방지)
         self._thread_locks: dict[int, asyncio.Lock] = {}  # 카드별 스레드 만들기 잠금
+        self._index: WordIndex | None = None       # 낱말 → 사전 단어 색인 (utils/word_index.py)
+        self._index_version = -1                   # 색인을 만들 때의 db.data_version
 
     async def cog_load(self) -> None:
         self.bot.add_dynamic_items(*DYNAMIC_ITEMS)
@@ -405,8 +489,8 @@ class Sentences(commands.Cog, name=COG_NAME):
     # ── 문장 준비 ────────────────────────────────────────────────
     async def sync_seed(self) -> None:
         """utils/sentence_seed.py 의 문장을 DB 에 맞추고, 관련 단어를 이 DB 의 word_id 로 연결합니다."""
-        names = [name for s in SEED_SENTENCES for name in s.word_names()]
-        found = await self.db.find_word_ids_by_names(names)
+        index = await self.word_index()
+        found = index.resolve([name for s in SEED_SENTENCES for name in s.word_names()])
         rows = [
             (s.id, s.category, s.korean_text, s.ksl_gloss, s.translation_tip, s.difficulty,
              s.source, s.related_word_ids(found))
@@ -417,10 +501,18 @@ class Sentences(commands.Cog, name=COG_NAME):
 
         missing = sorted({w for s in SEED_SENTENCES for w in s.unresolved_words(found)})
         log.info(
-            "🗣️ 문장 수어: 문장 %d개 준비 · 관련 단어 %d개 연결%s",
-            total, sum(len(row[7]) for row in rows),
+            "🗣️ 문장 수어: 문장 %d개 준비 · 관련 단어 %d개 연결 (사전 %d개 · 다른 이름 %d개로 찾음)%s",
+            total, sum(len(row[7]) for row in rows), len(index), index.alias_count,
             f" · 사전에 없는 단어 {len(missing)}개: {', '.join(missing)}" if missing else "",
         )
+
+    async def word_index(self) -> WordIndex:
+        """사전 단어 색인. 단어가 동기화 · 삭제되면(data_version 이 바뀌면) 새로 만듭니다."""
+        version = self.db.data_version
+        if self._index is None or version != self._index_version:
+            self._index = WordIndex(await self.db.get_word_names())
+            self._index_version = version
+        return self._index
 
     async def reload(self) -> None:
         self._sentences = {int(row["id"]): row for row in await self.db.get_sentences()}
@@ -523,19 +615,28 @@ class Sentences(commands.Cog, name=COG_NAME):
             return
 
         sentence = await self.get_sentence(sentence_id)
-        title = f"📚 관련 단어 : {word['word_name']} [{word['category']}]"
-        footer = f"「{truncate(sentence['korean_text'], 40)}」의 관련 단어예요 🤟" if sentence else ""
+        await self._send_word_card(
+            interaction, word,
+            title=f"📚 관련 단어 : {word['word_name']} [{word['category']}]",
+            footer=f"「{truncate(sentence['korean_text'], 40)}」의 관련 단어예요 🤟" if sentence else "",
+        )
+
+    async def _send_word_card(
+        self, interaction: discord.Interaction, word: Row, *, title: str, footer: str
+    ) -> None:
+        """수어 Cog 의 단어 카드(수형 삽화 · 설명 · 링크)를 나에게만 보냅니다. (응답을 미룬 뒤에 부름)"""
         sign_cog = self.bot.get_cog(SIGN_COG_NAME)
         send_word_card = getattr(sign_cog, "send_word_card", None)
         if send_word_card is not None:
             await send_word_card(interaction, word, title=title, footer=footer)
             return
-
         # 수어 Cog 가 꺼져 있으면 설명만 보여 줍니다.
         embed = discord.Embed(
             title=title, description=truncate(html.unescape(word["meaning"] or ""), 4000),
-            color=category_meta(sentence["category"] if sentence else "")[2],
+            color=discord.Color.blurple(),
         )
+        if footer:
+            embed.set_footer(text=footer)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ── 수어문 제출 ──────────────────────────────────────────────
@@ -591,9 +692,51 @@ class Sentences(commands.Cog, name=COG_NAME):
                 "⚠️ 토론 스레드에 올리지 못했어요. 서버 관리자에게 봇의 **'공개 스레드 만들기' · "
                 "'스레드에서 메시지 보내기'** 권한을 확인해 달라고 알려 주세요. (제출 기록과 보상은 저장됐어요)"
             )
-        lines.append("👇 내 수어문과 모범 어순을 비교해 보세요!")
-        await interaction.followup.send(
-            "\n".join(lines), embed=build_gloss_embed(sentence, mine=text), ephemeral=True
+        view = await self._my_words_view(text, lines)
+        lines.append("👇 내 수어문과 참고 예시를 나란히 살펴보세요. 정답이 아니라 여러 표현 중 하나예요!")
+        message = await interaction.followup.send(
+            "\n".join(lines), embed=build_gloss_embed(sentence, mine=text),
+            view=view or discord.utils.MISSING, ephemeral=True, wait=True,
+        )
+        if view is not None:
+            view.message = message
+
+    async def _my_words_view(self, text: str, lines: list[str]) -> MyWordsView | None:
+        """수어문에서 사전 단어를 찾아 메뉴를 만들고, 안내 한 줄을 lines 에 덧붙입니다. (실패해도 제출은 그대로)"""
+        try:
+            matches, missing = (await self.word_index()).match_text(text)
+            words = {int(w["word_id"]): w for w in await self.db.get_words_by_ids([m.word_id for m in matches])}
+        except Exception:
+            log.exception("수어문에서 사전 단어를 찾지 못했습니다. (제출은 그대로 저장됨)")
+            return None
+
+        matches = [m for m in matches if m.word_id in words]  # 그사이 지워진 단어는 뺍니다
+        missing_text = ""
+        if missing:
+            shown = ", ".join(missing[:MISSING_TERMS_SHOWN]) + (" …" if len(missing) > MISSING_TERMS_SHOWN else "")
+            missing_text = f" (사전에서 찾지 못한 말: {safe_text(shown)})"
+        if not matches:
+            lines.append(
+                "🔎 내 수어문에서 사전 단어를 찾지 못했어요. 단어를 띄어 쓰거나 `/수어검색` 으로 찾아보세요." + missing_text
+            )
+            return None
+        lines.append(
+            f"🔎 내 수어문에서 사전 단어 **{len(matches)}개**를 찾았어요. "
+            "아래 메뉴에서 수형 삽화를 확인해 보세요!" + missing_text
+        )
+        return MyWordsView(self, matches, words)
+
+    async def show_my_word(self, interaction: discord.Interaction, match: WordMatch, view: MyWordsView) -> None:
+        # 메뉴를 처음 상태로 되돌려 같은 단어를 다시 골라도 열리게 합니다. (나에게만 보이는 메시지)
+        await interaction.response.edit_message(view=view)
+        word = await self.db.get_word_by_id(match.word_id)
+        if word is None:
+            await interaction.followup.send("이 단어는 사전에서 찾을 수 없어요 🥲", ephemeral=True)
+            return
+        await self._send_word_card(
+            interaction, word,
+            title=f"🔎 내가 쓴 단어 : {match.label} [{word['category']}]",
+            footer="내 수어문에서 찾은 단어예요. 다른 수형도 자유롭게 나눠 주세요 🤟",
         )
 
     def _remember_submit(self, user_id: int) -> None:
@@ -614,10 +757,7 @@ class Sentences(commands.Cog, name=COG_NAME):
 
         thread, created = await self.discussion_thread(card, sentence)
         if thread is not None:
-            content = (
-                "💬 **수어 토론방**이 열렸어요! 이 문장을 수어로 어떻게 옮길지 자유롭게 이야기해 주세요.\n"
-                "카드의 **[✍️ 내 수어문 작성하기]** 로 내 어순을 올리거나, 여기에 바로 댓글로 의견을 남겨도 좋아요 🤟"
-            ) if created else None
+            content = discussion_intro(sentence) if created else None
             try:
                 return await self._send_in_thread(thread, content=content, embed=embed, allowed_mentions=quiet)
             except discord.HTTPException as error:
