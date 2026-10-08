@@ -97,9 +97,8 @@ STORYBOARD_CACHE_SIZE = 128      # 만든 스토리보드를 메모리에 보관
 # 영상 첫 장면을 캡처한 사진의 파일 이름 (예: MOV000265527_215X161.jpg) - 삽화가 있으면 이건 뺍니다
 _VIDEO_FRAME_NAME = re.compile(r"^MOV\d+_\d+x\d+$", re.IGNORECASE)
 # 국립국어원에 사진을 요청할 때의 헤더 - 일반 브라우저와 같은 모양으로 보냅니다.
-# ⚠️ 2026-10-07~08: 운영 VM(오사카) · 국내 PC · 일반 브라우저 모두 sldict.korean.go.kr 사진에 연결되지
-#    않았습니다. (헤더와 무관 · 연결 시간 초과) 서버 쪽 장애로 보이며, 받을 수 있게 되면
-#    scripts/bulk_download_images.py 로 국내 PC 에서 미리 받아 VM 디스크 캐시로 옮겨 쓸 수 있습니다.
+# ⚠️ sldict.korean.go.kr 사진 서버는 http(80번)가 닫혀 있고 https(443번)만 응답합니다. (2026-10-08 확인 ·
+#    국내 PC 와 운영 VM 모두 https 200) 그래서 봇은 PhotoFetcher(https_download=True) 로 받습니다.
 PHOTO_REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

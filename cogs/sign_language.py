@@ -800,7 +800,9 @@ class SignLanguage(commands.Cog, name="수어"):
         self.bot = bot
         self.db = db
         # 수형 사진을 봇이 직접 받아 첨부합니다. (명령어마다 defer 한 뒤에 부름)
-        self.photos = PhotoFetcher()
+        # 국립국어원 사진 서버는 http(80번)가 닫혀 있고 https(443번)만 열려 있어 https 로 받습니다.
+        # (DB 주소 · 디스크 캐시 파일 이름은 원래 http 주소 그대로라 이미 옮겨 둔 캐시도 그대로 씁니다)
+        self.photos = PhotoFetcher(https_download=True)
 
     async def cog_load(self) -> None:
         self.prefetch_daily_photos.start()
