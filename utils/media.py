@@ -32,13 +32,14 @@ import io
 import logging
 import os
 import re
+import socket
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 import discord
@@ -61,24 +62,29 @@ _UNSAFE_CHARS = re.compile(r'[\s\x00-\x1f\x7f<>"]')
 
 # ── 사진 직접 받기 (PhotoFetcher) ──
 PHOTO_FETCH_TIMEOUT = 5.0        # 초 - 한 번 받는 데 기다리는 최대 시간 (명령어는 defer 뒤라 여유가 있음)
+PHOTO_CONNECT_TIMEOUT = 3.0      # 초 - 서버와 연결(TCP)만 기다리는 시간. 서버가 아예 응답이 없으면 여기서 빨리 끝납니다
 PHOTO_FETCH_ATTEMPTS = 2         # 시간 초과 · 연결 끊김 · 5xx 일 때 한 번 더 시도
 PHOTO_RETRY_BACKOFF = 0.5        # 초 - 다시 시도하기 전 잠깐 쉬는 시간
 PHOTO_PREFETCH_TIMEOUT = 20.0    # 초 - 미리 받기(기다리는 사람이 없음)는 한 번에 더 오래 기다립니다
 PHOTO_MAX_BYTES = 2 * 1024 * 1024  # 이보다 큰 파일은 받지 않습니다 (수형 사진은 10~30KB)
 PHOTO_CACHE_SIZE = 512           # 메모리에 보관할 사진 수 (디스크에는 개수 제한 없이 보관)
 PHOTO_RETRY_AFTER = 600.0        # 초 - 끝내 받지 못한 주소는 이 시간 동안 다시 시도하지 않습니다
+# 서버 차단기: 같은 서버에서 연속으로 이만큼 연결 실패(시간 초과 · 연결 끊김 · 5xx)하면
+# PHOTO_BREAKER_COOLDOWN 동안 그 서버에는 요청하지 않고 디스크에 있는 사진만 씁니다.
+# (서버 장애 중에 명령어마다 10초씩 기다리게 하지 않으려는 것 · 지나면 한 번 다시 시도해 봄)
+PHOTO_BREAKER_THRESHOLD = 3
+PHOTO_BREAKER_COOLDOWN = 600.0   # 초
 # 디스크 캐시 위치 (.gitignore 의 data/ 아래라 저장소에 올라가지 않습니다)
 PHOTO_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache" / "images"
 PHOTO_MISSING_NOTICE = (
-    "국립국어원 미디어 서버가 늦게 응답해 사진을 불러오지 못했어요. "
-    "아래 🎬 수어 영상 버튼으로 동작을 확인해 주세요."
+    "국립국어원 수어사전 서버가 응답하지 않아 사진을 불러오지 못했어요. "
+    "아래 버튼으로 영상을 확인해 주세요. (사전 서버가 멈춘 동안은 링크도 열리지 않을 수 있어요)"
 )
 PHOTO_FILENAME = "sign"          # 첨부 파일 이름 (확장자는 받은 파일을 보고 붙임 · 단어명이 드러나지 않음)
 # 국립국어원에 사진을 요청할 때의 헤더 - 일반 브라우저와 같은 모양으로 보냅니다.
-# ⚠️ 운영 VM(Oracle 오사카)은 헤더와 관계없이 국립국어원에 연결 자체가 안 됩니다. (해외 IP 차단 ·
-#    curl 도 브라우저 헤더 · 봇 헤더 모두 15초 연결 시간 초과 · 2026-10-07) 그래서 VM 의 사진은
-#    국내 PC 에서 scripts/bulk_download_images.py 로 미리 받아 옮겨 둔 디스크 캐시로 보여 줍니다.
-#    이 헤더는 국내 PC 의 일괄 다운로드도 같은 PhotoFetcher 로 받기 때문에 브라우저와 같은 모양으로 둡니다.
+# ⚠️ 2026-10-07~08: 운영 VM(오사카) · 국내 PC · 일반 브라우저 모두 sldict.korean.go.kr 사진에 연결되지
+#    않았습니다. (헤더와 무관 · 연결 시간 초과) 서버 쪽 장애로 보이며, 받을 수 있게 되면
+#    scripts/bulk_download_images.py 로 국내 PC 에서 미리 받아 VM 디스크 캐시로 옮겨 쓸 수 있습니다.
 PHOTO_REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -89,6 +95,55 @@ PHOTO_REQUEST_HEADERS = {
 }
 
 _reported_unusable: set[str] = set()  # 형식 오류로 건너뛴 사진 주소 (같은 경고를 반복하지 않도록)
+
+# 버전에 따라 없는 aiohttp 예외도 있어 있는 것만 모읍니다. (ConnectionTimeoutError 는 3.10+)
+_CONNECT_TIMEOUT_ERRORS = tuple(
+    cls for cls in (getattr(aiohttp, "ConnectionTimeoutError", None),) if cls is not None
+)
+_READ_TIMEOUT_ERRORS = tuple(
+    cls for cls in (getattr(aiohttp, "SocketTimeoutError", None),) if cls is not None
+)
+
+
+def describe_error(exc: BaseException, timeout: float | None = None) -> str:
+    """
+    네트워크 오류를 '예외 종류 · 무슨 뜻인지' 한 줄로 바꿉니다. (원인 파악용 로그)
+
+    >>> describe_error(asyncio.TimeoutError(), 5)
+    'TimeoutError · 5초 안에 다 받지 못함'
+    """
+    kind = type(exc).__name__
+    if isinstance(exc, PhotoError):
+        return f"{kind} · {exc}"
+    if _CONNECT_TIMEOUT_ERRORS and isinstance(exc, _CONNECT_TIMEOUT_ERRORS):
+        detail = f"{PHOTO_CONNECT_TIMEOUT:g}초 안에 서버와 연결되지 않음 (서버 무응답 · 장애 · 방화벽)"
+    elif _READ_TIMEOUT_ERRORS and isinstance(exc, _READ_TIMEOUT_ERRORS):
+        detail = "연결은 됐지만 서버가 데이터를 보내지 않음"
+    elif isinstance(exc, asyncio.TimeoutError):
+        detail = f"{timeout:g}초 안에 다 받지 못함" if timeout else "시간 초과"
+    elif isinstance(exc, aiohttp.ClientConnectorError) and isinstance(exc.os_error, socket.gaierror):
+        detail = f"도메인을 찾을 수 없음 (DNS) · {exc}"
+    elif isinstance(exc, aiohttp.ClientSSLError):
+        detail = f"보안 인증서(SSL) 오류 · {exc}"
+    elif isinstance(exc, aiohttp.ClientConnectorError):
+        detail = f"연결 실패 · {exc}"
+    else:
+        detail = str(exc) or "알 수 없는 오류"
+    return f"{kind} · {detail}"
+
+
+def _https_version(url: str) -> str:
+    """http 주소를 https 로 바꿉니다. (받을 때만 쓰고, 디스크 파일 이름은 원래 주소 기준)"""
+    parts = urlsplit(url)
+    return urlunsplit(parts._replace(scheme="https")) if parts.scheme == "http" else url
+
+
+def _server_key(url: str) -> str:
+    """서버 차단기의 기준 - 호스트:포트 (같은 서버의 사진끼리 묶음)"""
+    try:
+        return urlsplit(url).netloc.lower()
+    except ValueError:
+        return ""
 
 
 def _upgradable(host: str) -> bool:
@@ -199,11 +254,26 @@ class PhotoFetcher:
       - 받은 사진은 디스크에 영구 보관합니다. (임시 파일에 쓴 뒤 이름을 바꿔 반쯤 쓴 파일이 남지 않음)
       - 끝내 받지 못한 주소는 PHOTO_RETRY_AFTER(10분) 동안 다시 시도하지 않습니다.
       - 같은 주소를 동시에 여러 번 찾으면 한 번만 받고 나눠 씁니다. (미리 받기와 명령어가 겹쳐도)
+      - 서버 차단기: 같은 서버에서 연결 실패가 breaker_threshold(기본 3)번 이어지면 PHOTO_BREAKER_COOLDOWN(10분)
+        동안 그 서버에 요청하지 않습니다. 그동안 디스크에 없는 사진은 기다림 없이 바로 안내 문구로 갑니다.
     디스크 폴더를 만들 수 없으면 디스크 캐시 없이(메모리만) 동작합니다.
     Cog 가 하나를 만들어 쓰고, Cog 를 내릴 때 close() 합니다.
     """
 
-    def __init__(self, cache_dir: Path | None = PHOTO_CACHE_DIR) -> None:
+    def __init__(
+        self,
+        cache_dir: Path | None = PHOTO_CACHE_DIR,
+        *,
+        https_download: bool = False,
+        breaker_threshold: int = PHOTO_BREAKER_THRESHOLD,
+    ) -> None:
+        # https_download   : 받을 때만 https 로 요청합니다. (http 80번이 막히고 443만 열린 경우 대비)
+        #                    디스크 파일 이름은 원래 주소 기준이라 봇이 찾는 이름은 그대로입니다.
+        # breaker_threshold: 연속 실패 몇 번에 서버 차단기를 열지 (여러 장을 동시에 받는 일괄 받기는 크게)
+        self.https_download = https_download
+        self.breaker_threshold = breaker_threshold
+        self._host_failures: dict[str, int] = {}
+        self._host_open_until: dict[str, float] = {}  # 서버 차단기가 열려 있는(요청 안 함) 시각까지
         self._session: aiohttp.ClientSession | None = None
         self._memory: OrderedDict[str, Photo] = OrderedDict()
         self._failed_at: dict[str, float] = {}
@@ -274,6 +344,11 @@ class PhotoFetcher:
         except asyncio.TimeoutError:
             return None
 
+    def host_down(self, url: str) -> bool:
+        """그 주소의 서버가 응답하지 않는다고 보고 잠시 요청을 멈춘 상태인지. (서버 차단기)"""
+        until = self._host_open_until.get(_server_key(url))
+        return until is not None and time.monotonic() < until
+
     async def is_cached(self, url: str) -> bool:
         """이미 메모리나 디스크에 있는 사진인지. (국립국어원에 요청하지 않습니다)"""
         return url in self._memory or await self._disk_path(url) is not None
@@ -303,21 +378,26 @@ class PhotoFetcher:
         """디스크 → 국립국어원 순서로 찾고, 새로 받으면 디스크에 저장합니다."""
         photo = await self._read_disk(url)
         if photo is None:
+            server = _server_key(url)
+            if self._breaker_blocks(server):
+                return None  # 서버가 멈춘 것으로 보이는 동안은 요청하지 않습니다 (디스크에 있는 사진만)
+            source = _https_version(url) if self.https_download else url
             started = time.monotonic()
             try:
-                photo = await self._download_with_retry(url, timeout)
+                photo = await self._download_with_retry(source, timeout)
             except (aiohttp.ClientError, asyncio.TimeoutError, PhotoError) as exc:
                 self._failed_at[url] = time.monotonic()
-                reason = str(exc) or type(exc).__name__
-                if isinstance(exc, asyncio.TimeoutError):
-                    reason = f"{timeout:g}초 안에 받지 못함"
-                log.warning("수형 사진을 받지 못했습니다 (재시도 포함): %s (%s)", url, reason)
+                reason = describe_error(exc, timeout)
+                log.warning("수형 사진을 받지 못했습니다 (재시도 포함): %s (%s)", source, reason)
+                if _retryable(exc):
+                    self._record_server_failure(server, reason)
                 return None
             except Exception:
                 # 예상하지 못한 오류도 명령어까지 올리지 않습니다. (사진 없이 보내면 그만)
                 self._failed_at[url] = time.monotonic()
                 log.exception("수형 사진을 받다가 예상하지 못한 오류: %s", url)
                 return None
+            self._record_server_success(server)
             await self._write_disk(url, photo)
             if not self._confirmed:
                 self._confirmed = True
@@ -340,13 +420,14 @@ class PhotoFetcher:
             except (aiohttp.ClientError, asyncio.TimeoutError, PhotoError) as exc:
                 if attempt == PHOTO_FETCH_ATTEMPTS or not _retryable(exc):
                     raise
-                log.info("사진 받기 다시 시도 (%s): %s", str(exc) or type(exc).__name__, url)
+                log.info("사진 받기 다시 시도 (%s): %s", describe_error(exc, timeout), url)
                 await asyncio.sleep(PHOTO_RETRY_BACKOFF * attempt)
         raise AssertionError("unreachable")
 
     async def _download(self, url: str, timeout: float) -> Photo:
         session = self._ensure_session()
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+        limits = aiohttp.ClientTimeout(total=timeout, sock_connect=min(PHOTO_CONNECT_TIMEOUT, timeout))
+        async with session.get(url, timeout=limits) as resp:
             if resp.status != 200:
                 raise PhotoError(f"HTTP {resp.status}", retryable=resp.status >= 500 or resp.status == 429)
             if resp.content_length is not None and resp.content_length > PHOTO_MAX_BYTES:
@@ -365,6 +446,37 @@ class PhotoFetcher:
         if extension is None:
             raise PhotoError(f"사진 파일이 아님 (Content-Type: {content_type} · {len(data)}바이트)")
         return Photo(data, f"{PHOTO_FILENAME}.{extension}")
+
+    # ── 서버 차단기 ─────────────────────────────────────────────
+    def _breaker_blocks(self, server: str) -> bool:
+        """차단 중이면 True. 차단 시간이 지났으면 이번 한 번만 보내 보고(성공하면 풀림) 나머지는 계속 막습니다."""
+        until = self._host_open_until.get(server)
+        if until is None:
+            return False
+        now = time.monotonic()
+        if now < until:
+            return True
+        self._host_open_until[server] = now + PHOTO_BREAKER_COOLDOWN  # 시험 삼아 한 번만 통과
+        return False
+
+    def _record_server_failure(self, server: str, reason: str) -> None:
+        count = self._host_failures.get(server, 0) + 1
+        self._host_failures[server] = count
+        if count < self.breaker_threshold:
+            return
+        newly_open = server not in self._host_open_until
+        self._host_open_until[server] = time.monotonic() + PHOTO_BREAKER_COOLDOWN
+        if newly_open:
+            log.warning(
+                "🚧 %s 서버가 응답하지 않아 %d분 동안 사진 받기를 멈춥니다. "
+                "(디스크에 있는 사진만 씁니다 · 마지막 오류: %s)",
+                server, PHOTO_BREAKER_COOLDOWN // 60, reason,
+            )
+
+    def _record_server_success(self, server: str) -> None:
+        self._host_failures.pop(server, None)
+        if self._host_open_until.pop(server, None) is not None:
+            log.info("✅ %s 서버가 다시 응답합니다. 사진 받기를 다시 시작합니다.", server)
 
     # ── 디스크 캐시 (읽기 · 쓰기는 별도 스레드) ─────────────────
     def _disk_stem(self, url: str) -> Path | None:
