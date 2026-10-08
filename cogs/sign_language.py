@@ -811,6 +811,25 @@ class SignLanguage(commands.Cog, name="수어"):
         self.prefetch_daily_photos.cancel()
         await self.photos.close()
 
+    # ── 다른 Cog 에서 쓰는 단어 카드 ─────────────────────────────
+    async def send_word_card(
+        self, interaction: discord.Interaction, word: Row, *, title: str, footer: str = ""
+    ) -> None:
+        """
+        단어 카드(수형 삽화 · 설명 · 영상/사전 버튼)를 나에게만 보이는 메시지로 보냅니다.
+        /문장수어 의 '📚 관련 단어 수형 보기'가 bot.get_cog("수어") 로 불러 씁니다.
+        (cogs 끼리 import 하지 않고, 사진 캐시 · 400 재전송도 이 Cog 의 것을 그대로 씁니다)
+        ⚠️ interaction 은 이미 응답(defer 등)한 상태여야 합니다. followup 으로 보냅니다.
+        """
+        embed, content = build_word_embed(word, title=title, color=COLOR_SEARCH)
+        if footer:
+            embed.set_footer(text=footer)
+        photo = await self.photos.attach(embed, word_images(word))
+        await send_with_media_fallback(
+            interaction.followup.send,
+            embed=embed, view=word_link_view(word), photo=photo, content=content, ephemeral=True,
+        )
+
     # ── 오늘의 수어 사진 미리 받기 ──────────────────────────────
     @tasks.loop(time=PREFETCH_TIME)
     async def prefetch_daily_photos(self) -> None:
