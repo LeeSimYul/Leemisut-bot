@@ -405,7 +405,14 @@ def pick_detail_url(item: dict[str, Any]) -> str:
 
 
 def pick_image_url(item: dict[str, Any]) -> str:
-    """수형 사진 주소를 고릅니다. (임베드에 그대로 띄울 수 있는 이미지)"""
+    """
+    대표 수형 이미지 1장을 고릅니다. (임베드에 그대로 띄울 수 있는 이미지)
+    signImages 의 수어 삽화(IMG…_700X466.jpg)를 먼저 고르고, 없을 때만 다른 칸
+    (referenceIdentifier 의 영상 캡처 MOV…_215X161.jpg 등)에서 찾습니다.
+    """
+    illustrations = pick_image_urls(item)
+    if illustrations:
+        return illustrations[0]
     for value in _values(item, _URL_FIELDS, split_commas=True):
         if _is_url(value) and _has_ext(value, _IMAGE_EXT):
             return value

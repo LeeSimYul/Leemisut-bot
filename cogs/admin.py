@@ -58,9 +58,14 @@ def _summarize(meaning: str, limit: int = 40) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def _count_with_image(rows: list[tuple[str, ...]]) -> int:
-    """수집한 단어 중 수형 사진 주소(image_url, 4번째 값)가 있는 단어 수."""
-    return sum(1 for row in rows if len(row) > 3 and row[3])
+def _image_summary(rows: list[tuple[str, ...]]) -> str:
+    """
+    수집한 단어의 수형 이미지 현황 한 줄.
+    (image_url = 4번째 값 · image_urls = 7번째 값, 줄바꿈으로 구분한 signImages 전체)
+    """
+    with_image = sum(1 for row in rows if (len(row) > 3 and row[3]) or (len(row) > 6 and row[6]))
+    multi = sum(1 for row in rows if len(row) > 6 and len(row[6].splitlines()) >= 2)
+    return f"🖼️ 수형 이미지 포함 {with_image}개 (여러 장 {multi}개)"
 
 
 def _fail_embed(exc: Exception) -> discord.Embed:
@@ -173,14 +178,14 @@ class Admin(commands.Cog, name="관리"):
         if 미리보기:
             summary = (
                 f"📗 검증 통과 **{len(rows)}개** (저장하지 않음)\n"
-                f"🖼️ 수형 사진 포함 {_count_with_image(rows)}개\n"
+                f"{_image_summary(rows)}\n"
                 f"🚫 필터로 제외 {len(rejected)}개"
             )
         else:
             summary = (
                 f"✅ 새로 저장 **{saved}개**\n"
                 f"📗 검증 통과 {len(rows)}개 (이미 있던 단어 {len(rows) - saved}개)\n"
-                f"🖼️ 수형 사진 포함 {_count_with_image(rows)}개\n"
+                f"{_image_summary(rows)}\n"
                 f"🚫 필터로 제외 {len(rejected)}개"
             )
         embed.add_field(name="결과", value=summary, inline=False)
@@ -291,7 +296,7 @@ class Admin(commands.Cog, name="관리"):
             value=(
                 f"✅ 새로 저장 **{saved}개**\n"
                 f"📗 검증 통과 {len(rows)}개 (이미 있던 단어 {len(rows) - saved}개)\n"
-                f"🖼️ 수형 사진 포함 {_count_with_image(rows)}개\n"
+                f"{_image_summary(rows)}\n"
                 f"🚫 필터로 제외 {len(rejected)}개"
             ),
             inline=False,

@@ -84,11 +84,13 @@ PHOTO_FILENAME = "sign"          # 첨부 파일 이름 (확장자는 받은 파
 
 # ── 수형 이미지 여러 장 → 한 장(스토리보드) ──
 STORYBOARD_MAX_IMAGES = 6        # 한 장으로 이어 붙일 최대 이미지 수
-STORYBOARD_PER_ROW = 3           # 한 줄에 놓을 장수 (넘으면 다음 줄 · 모바일에서 너무 작아지지 않게)
-STORYBOARD_MAX_HEIGHT = 360      # 칸 높이 상한(px) - 모든 칸을 같은 높이로 맞춥니다
-STORYBOARD_GAP = 28              # 칸 사이 간격(px) - 가운데에 ▶ 화살표
-STORYBOARD_ROW_GAP = 14          # 줄 사이 간격(px)
-STORYBOARD_PAD = 10              # 바깥 여백(px)
+# 모바일 디스코드는 이미지를 화면 폭에 맞춰 줄여서, 한 줄의 장수가 곧 한 칸의 크기입니다.
+# (3장이면 칸마다 화면의 1/3, 2장이면 1/2) 손 모양이 보이도록 한 줄에 2장씩 놓고, 3장째는 다음 줄 가운데.
+STORYBOARD_PER_ROW = 2
+STORYBOARD_MAX_HEIGHT = 320      # 칸 높이 상한(px) - 700×466 삽화는 약 481×320 으로 줄여 맞춥니다
+STORYBOARD_GAP = 28              # 칸 사이 간격 최솟값(px) - 칸이 크면 비례해서 넓힘 · 가운데에 ▶ 화살표
+STORYBOARD_ROW_GAP = 14          # 줄 사이 간격 최솟값(px)
+STORYBOARD_PAD = 10              # 바깥 여백 최솟값(px)
 STORYBOARD_BG = (242, 243, 245)  # 배경 (밝은 회색 - 디스코드 밝은/어두운 화면 모두 무난)
 STORYBOARD_BADGE = (88, 101, 242)  # 순서 번호 동그라미 (디스코드 보라)
 STORYBOARD_ARROW = (153, 170, 181)
@@ -260,7 +262,8 @@ def _badge_font(size: int) -> Any:
 def compose_storyboard(images: Sequence[bytes]) -> bytes:
     """
     여러 장의 수형 이미지를 순서 번호(①②③)와 ▶ 화살표를 넣어 한 장의 JPEG 로 이어 붙입니다.
-    모든 칸을 같은 높이로 맞추고, STORYBOARD_PER_ROW 장마다 줄을 바꿉니다.
+    모든 칸을 같은 높이로 맞추고(큰 이미지는 STORYBOARD_MAX_HEIGHT 로 줄임 · 작은 것은 그대로),
+    STORYBOARD_PER_ROW 장마다 줄을 바꿉니다. 칸이 모자란 줄은 가운데에 둡니다.
     (Pillow 가 필요합니다 · 시간이 조금 걸리므로 asyncio.to_thread 로 부르세요)
     """
     from PIL import Image, ImageDraw
@@ -279,22 +282,28 @@ def compose_storyboard(images: Sequence[bytes]) -> bytes:
         else frame.resize((max(1, round(frame.width * height / frame.height)), height), Image.LANCZOS)
         for frame in frames
     ]
-    rows = [frames[i: i + STORYBOARD_PER_ROW] for i in range(0, len(frames), STORYBOARD_PER_ROW)]
-    width = max(sum(f.width for f in row) + STORYBOARD_GAP * (len(row) - 1) for row in rows)
-    canvas = Image.new(
-        "RGB",
-        (width + STORYBOARD_PAD * 2,
-         len(rows) * height + (len(rows) - 1) * STORYBOARD_ROW_GAP + STORYBOARD_PAD * 2),
-        STORYBOARD_BG,
-    )
-    draw = ImageDraw.Draw(canvas)
+    # 간격 · 화살표 · 번호는 칸 크기에 비례 (작은 캡처 사진에서도 너무 크지 않게 최솟값)
+    gap = max(STORYBOARD_GAP, height // 8)
+    row_gap = max(STORYBOARD_ROW_GAP, height // 20)
+    pad = max(STORYBOARD_PAD, height // 26)
+    arrow = gap * 0.35  # ▶ 반 높이
     radius = max(11, height // 14)
     font = _badge_font(round(radius * 1.2))
 
+    rows = [frames[i: i + STORYBOARD_PER_ROW] for i in range(0, len(frames), STORYBOARD_PER_ROW)]
+    row_widths = [sum(f.width for f in row) + gap * (len(row) - 1) for row in rows]
+    width = max(row_widths)
+    canvas = Image.new(
+        "RGB",
+        (width + pad * 2, len(rows) * height + (len(rows) - 1) * row_gap + pad * 2),
+        STORYBOARD_BG,
+    )
+    draw = ImageDraw.Draw(canvas)
+
     number = 1
-    y = STORYBOARD_PAD
-    for row in rows:
-        x = STORYBOARD_PAD
+    y = pad
+    for row, row_width in zip(rows, row_widths):
+        x = pad + (width - row_width) // 2  # 칸이 모자란 줄은 가운데로
         for index, frame in enumerate(row):
             canvas.paste(frame, (x, y))
             cx, cy = x + radius + 6, y + radius + 6
@@ -303,10 +312,13 @@ def compose_storyboard(images: Sequence[bytes]) -> bytes:
             number += 1
             x += frame.width
             if index < len(row) - 1:
-                ax, ay = x + STORYBOARD_GAP // 2, y + height // 2
-                draw.polygon([(ax - 6, ay - 9), (ax - 6, ay + 9), (ax + 8, ay)], fill=STORYBOARD_ARROW)
-                x += STORYBOARD_GAP
-        y += height + STORYBOARD_ROW_GAP
+                ax, ay = x + gap / 2, y + height / 2
+                draw.polygon(
+                    [(ax - arrow * 0.7, ay - arrow), (ax - arrow * 0.7, ay + arrow), (ax + arrow * 0.9, ay)],
+                    fill=STORYBOARD_ARROW,
+                )
+                x += gap
+        y += height + row_gap
 
     out = io.BytesIO()
     canvas.save(out, "JPEG", quality=88, optimize=True)

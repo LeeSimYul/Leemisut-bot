@@ -996,6 +996,13 @@ class Database:
         )
         return int(row["cnt"]) if row else 0
 
+    async def count_words_with_image_urls(self) -> int:
+        """수형 이미지 목록(image_urls)이 채워진 단어 수. (/수어전체동기화 로 채워졌는지 확인용)"""
+        row = await self.backend.fetch_one(
+            "SELECT COUNT(*) AS cnt FROM sign_words WHERE image_urls <> ''"
+        )
+        return int(row["cnt"]) if row else 0
+
     async def get_daily_word(self, day: date) -> Row | None:
         """날짜를 기준으로 단어를 골라, 같은 날에는 모두에게 같은 단어를 보여줍니다."""
         count = await self.count_words()
