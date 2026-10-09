@@ -6,10 +6,11 @@ utils/word_index.py
     - 시드 문장의 관련 단어 연결 (utils/sentence_seed.py 의 words → sign_sentences.related_word_ids)
     - 유저가 제출한 수어문에서 단어를 뽑아 '🔎 내가 쓴 단어 수형 확인하기' 메뉴로 보여 주기
 
-■ 이렇게 찾습니다 (먼저 찾은 쪽을 씁니다)
+■ 이렇게 찾습니다 (앞 단계에서 찾으면 뒤 단계는 보지 않습니다)
     1. 대표 단어명(word_name)이 같은 단어
     2. 표제어에 함께 적힌 다른 이름(aliases)이 같은 단어  (예: '감사' → '고맙다,감사' 단어)
-    3. '하다' 를 붙이거나 뗀 형태                        (예: '부탁' ↔ '부탁하다')
+    3. '하다' 를 붙이거나 뗀 형태의 대표 단어명 → 다른 이름 (예: '부탁' ↔ '부탁하다')
+    대표 단어명이 있으면 다른 이름은 보지 않습니다. ('떨어지다' 에 '실격,떨어지다' 같은 단어가 섞이지 않게)
     같은 이름의 단어(동음이의어)는 모두 돌려줍니다. 고르는 사람이 뜻 설명을 보고 고릅니다.
 
 ■ 수어문 나누기
@@ -86,13 +87,10 @@ class WordIndex:
         if not term:
             return []
         for candidate in (term, *variants(term)):
-            ids = self._by_name.get(candidate, []) + [
-                i for i in self._by_alias.get(candidate, []) if i not in self._by_name.get(candidate, [])
-            ]
-            if ids:
-                return [
-                    WordMatch(term, i, self._names[i], exact=self._names[i] == term) for i in ids
-                ]
+            for table in (self._by_name, self._by_alias):
+                ids = table.get(candidate, [])
+                if ids:
+                    return [WordMatch(term, i, self._names[i], exact=self._names[i] == term) for i in ids]
         return []
 
     def ids(self, term: str) -> list[int]:

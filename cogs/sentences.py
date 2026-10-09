@@ -3,7 +3,9 @@ cogs/sentences.py
 조교 이미숫 - /문장수어 (문장 수어 · 실전 회화 참여형 학습)
 
 ■ 흐름
-  1. /문장수어 [카테고리] → 문장 카드를 채널에 올립니다. (원문 · 분류 · 난이도 · 표현 가이드 · 핵심 단어)
+  1. /문장수어 [카테고리] → 문장 카드를 채널에 올립니다. (원문 · 분류 · 난이도 · 한 줄 가이드 · 핵심 단어)
+     참여 방법 · 보상은 카드 맨 아래(푸터) 한 줄로만 안내해 카드를 짧게 유지합니다.
+     카테고리를 비우면 갈래를 먼저 고르게(균등) 뽑아, 문장 수가 많은 갈래만 나오지 않게 합니다.
   2. 카드 아래 버튼 · 메뉴 (누구나 누를 수 있습니다)
      [✍️ 내 수어문 작성하기]  모달 창에 수어 어순을 적어 제출 → 카드에서 열린 공개 스레드에 올라갑니다.
                                그날(KST) 첫 제출이면 포인트 · 경험치를 줍니다. (utils/rewards.py)
@@ -16,7 +18,8 @@ cogs/sentences.py
 
 ■ 어조: 수어는 맥락 · 위치에 따라 여러 표현이 가능한 언어라 '정답 · 모범' 대신 '참고 예시'라고 부릅니다.
 
-■ /명언 · /격언 은 이 명령어로 합쳤습니다. (예전 명언 · 사자성어도 '격언 · 명언' 갈래에 옮겨 두었습니다)
+■ /명언 · /격언 은 이 명령어로 합쳤습니다. 예전 문구(수능 필적확인란 · 문학 · 사자성어 · 명언)는
+   모두 '명언 · 문학' · '격언 · 사자성어' 갈래로 옮겨 두었습니다. (utils/sentence_seed.py)
 ■ 봇이 다시 켜져도 예전 카드의 버튼이 동작합니다.
    custom_id 에 문장 번호를 넣고(sentence:write:12), discord.ui.DynamicItem 으로 받아 처리합니다.
 ■ 문장은 봇이 켜질 때 utils/sentence_seed.py 의 내용으로 DB(sign_sentences)를 맞추고 메모리에 들고 씁니다.
@@ -83,16 +86,19 @@ THREAD_ARCHIVED = 50083         # 보관된 스레드라 바로 보낼 수 없�
 # 갈래별 이모지 · 보여 줄 이름 · 색 (DB 값은 utils/sentence_seed.py 의 CATEGORIES)
 CATEGORY_META: dict[str, tuple[str, str, discord.Color]] = {
     "속담": ("🧓", "한국 속담", discord.Color.from_rgb(224, 168, 91)),
-    "명언": ("💡", "격언 · 명언", discord.Color.from_rgb(122, 198, 160)),
+    "격언": ("📜", "격언 · 사자성어", discord.Color.from_rgb(201, 140, 120)),
+    "명언": ("💡", "명언 · 문학", discord.Color.from_rgb(122, 198, 160)),
     "일상회화": ("☕", "일상 회화", discord.Color.from_rgb(126, 179, 255)),
     "VRChat": ("🥽", "VRChat 실전 수어", discord.Color.from_rgb(167, 139, 216)),
 }
 DIFFICULTY_LABELS = {1: "⭐ 입문", 2: "⭐⭐ 초급", 3: "⭐⭐⭐ 중급"}
 GUIDE_TEXT = (
-    "① 문장의 **핵심 단어**를 골라 보고\n"
-    "② 흔히 **시간 → 장소 → 주제 → 행동** 순으로 놓아요 (의문사 · 부정은 끝에 오는 경우가 많아요)\n"
-    "③ 질문 · 부정 · 정도는 **표정과 고개**로 더해 보세요\n"
-    "🌈 정답은 하나가 아니에요. 내가 떠올린 표현을 자유롭게 나눠 주세요!"
+    "🧭 흔히 **시간 → 장소 → 주제 → 행동** 순으로 놓고, 질문 · 부정은 **표정과 고개**로 더해요. "
+    "정답은 하나가 아니에요 🌈"
+)
+CARD_FOOTER = (
+    "💬 [내 수어문 작성하기]를 눌러 스레드 토론에 참여해 보세요! "
+    f"(첫 참여 시 +{SENTENCE_EXP} EXP / +{SENTENCE_POINTS}P) · 문장 #{{id}}"
 )
 GLOSS_FOOTER = (
     "💡 수어는 상황과 맥락, 상대방과의 위치에 따라 다양한 표현이 존중되는 언어예요. "
@@ -113,6 +119,7 @@ QUESTION_PROMPT_YN = "❓ 예/아니오로 답하는 질문이에요. 눈썹과 
 NEGATION_PROMPT = "🙅 부정 표현이 들어 있어요. 고개를 좌우로 흔드는 동작은 어느 단어와 함께하면 좋을까요?"
 CATEGORY_PROMPTS = {
     "속담": "🧓 속담은 글자 그대로 옮길 수도, 숨은 뜻을 풀어 옮길 수도 있어요. 어느 쪽이 더 잘 전해질까요?",
+    "격언": "📜 짧은 격언일수록 멈춤과 표정이 중요해요. 어디에서 잠깐 멈추면 뜻이 또렷해질까요?",
     "명언": "💡 이 말을 한 사람의 마음까지 전하려면 손동작의 속도와 표정을 어떻게 맞추면 좋을까요?",
     "일상회화": "☕ 실제 대화라면 어떤 상황에서 쓰게 될까요? 상황에 따라 표현이 달라지는지도 이야기해 봐요.",
     "VRChat": "🥽 VR 에서는 손이 인식되는 범위가 정해져 있어요. 손동작의 위치와 크기를 어떻게 하면 잘 보일까요?",
@@ -194,6 +201,18 @@ def word_chips(names: Iterable[str], limit: int = 900) -> str:
     return " · ".join(chips)
 
 
+def word_label(word: Row, terms: dict[int, str] | None, *, arrow: bool = False) -> str:
+    """
+    관련 단어 이름. 시드에 적은 말과 사전 대표 이름이 다르면 둘 다 보여 줍니다.
+    ('다시' 로 '또,다시' 단어를 찾았으면 칩은 '다시(또)', 메뉴는 '다시 → 또')
+    """
+    name = word["word_name"]
+    term = (terms or {}).get(int(word["word_id"]))
+    if not term or term == name:
+        return name
+    return f"{term} → {name}" if arrow else f"{term}({name})"
+
+
 def word_summary(word: Row, limit: int = 60) -> str:
     """선택 메뉴 설명 칸에 넣을 짧은 뜻. (동음이의어를 구분할 만큼)"""
     text = " ".join(html.unescape(word["meaning"] or "").split())
@@ -201,34 +220,26 @@ def word_summary(word: Row, limit: int = 60) -> str:
 
 
 # ── 임베드 ──────────────────────────────────────────────────────
-def build_sentence_embed(sentence: Row, words: list[Row]) -> discord.Embed:
-    """채널에 올리는 문장 카드."""
+def build_sentence_embed(
+    sentence: Row, words: list[Row], terms: dict[int, str] | None = None
+) -> discord.Embed:
+    """채널에 올리는 문장 카드. (원문 강조 · 정보 한 줄 · 가이드 한 줄 · 핵심 단어 · 푸터에 참여 안내)"""
     emoji, label, color = category_meta(sentence["category"])
     meta = [f"{emoji} **{label}**", DIFFICULTY_LABELS.get(int(sentence["difficulty"]), "")]
     if sentence["source"]:
         meta.append(sentence["source"])
     embed = discord.Embed(
         title="🤟 문장 수어 도전!",
-        description=f"> ### {sentence['korean_text']}\n\n" + " · ".join(m for m in meta if m),
+        description=(
+            f"> ### {sentence['korean_text']}\n"
+            + " · ".join(m for m in meta if m)
+            + f"\n\n{GUIDE_TEXT}"
+        ),
         color=color,
     )
-    embed.add_field(name="🧭 표현 가이드", value=GUIDE_TEXT, inline=False)
     if words:
-        embed.add_field(
-            name="📚 핵심 단어",
-            value=word_chips(w["word_name"] for w in words)
-                  + "\n아래 메뉴에서 고르면 수형 삽화를 나에게만 보여 줘요.",
-            inline=False,
-        )
-    embed.add_field(
-        name="✍️ 참여 방법",
-        value=(
-            "**[내 수어문 작성하기]** 로 수어 어순을 적으면 이 카드의 토론 스레드에 올라가요.\n"
-            f"오늘 첫 참여 보너스 **+{SENTENCE_POINTS} 포인트 · +{SENTENCE_EXP} EXP** 🎁"
-        ),
-        inline=False,
-    )
-    embed.set_footer(text=f"문장 #{sentence['id']} · 💡 참고 예시는 버튼을 누른 사람에게만 보여요")
+        embed.add_field(name="📚 핵심 단어", value=word_chips(word_label(w, terms) for w in words), inline=False)
+    embed.set_footer(text=CARD_FOOTER.format(id=sentence["id"]))
     return embed
 
 
@@ -381,14 +392,16 @@ class WordSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"sentence:
 DYNAMIC_ITEMS = (WriteButton, GlossButton, WordSelect)
 
 
-def build_card_view(sentence_id: int, words: list[Row]) -> discord.ui.View:
+def build_card_view(
+    sentence_id: int, words: list[Row], terms: dict[int, str] | None = None
+) -> discord.ui.View:
     """카드 아래 버튼 2개 + (관련 단어가 있으면) 선택 메뉴."""
     view = discord.ui.View(timeout=None)
     view.add_item(WriteButton(sentence_id))
     view.add_item(GlossButton(sentence_id))
     options = [
         discord.SelectOption(
-            label=truncate(word["word_name"], 100),
+            label=truncate(word_label(word, terms, arrow=True), 100),
             value=str(word["word_id"]),
             description=word_summary(word),
             emoji="📚",
@@ -473,6 +486,7 @@ class Sentences(commands.Cog, name=COG_NAME):
         self._thread_locks: dict[int, asyncio.Lock] = {}  # 카드별 스레드 만들기 잠금
         self._index: WordIndex | None = None       # 낱말 → 사전 단어 색인 (utils/word_index.py)
         self._index_version = -1                   # 색인을 만들 때의 db.data_version
+        self._terms: dict[int, dict[int, str]] = {}  # 문장 번호 → {word_id: 시드에 적은 말} (카드 표시용)
 
     async def cog_load(self) -> None:
         self.bot.add_dynamic_items(*DYNAMIC_ITEMS)
@@ -496,6 +510,7 @@ class Sentences(commands.Cog, name=COG_NAME):
              s.source, s.related_word_ids(found))
             for s in SEED_SENTENCES
         ]
+        self._terms = {s.id: s.matched_terms(found) for s in SEED_SENTENCES}
         total = await self.db.sync_sentences(rows)
         await self.reload()
 
@@ -537,12 +552,16 @@ class Sentences(commands.Cog, name=COG_NAME):
         """갈래에서 무작위로 하나 고릅니다. 같은 채널에서 직전에 나온 문장은 피합니다."""
         if not self._sentences:
             await self._reload_quietly()
-        pool = [
-            s for s in self._sentences.values() if category == CHOICE_ALL or s["category"] == category
-        ]
+        last = self._last_shown.get(channel_id or 0)
+        if category == CHOICE_ALL:
+            # 갈래를 먼저 고르게 뽑아, 문장이 많은 갈래만 자주 나오지 않게 합니다.
+            categories = sorted({s["category"] for s in self._sentences.values()})
+            if not categories:
+                return None
+            category = random.choice(categories)
+        pool = [s for s in self._sentences.values() if s["category"] == category]
         if not pool:
             return None
-        last = self._last_shown.get(channel_id or 0)
         sentence = random.choice([s for s in pool if int(s["id"]) != last] or pool)
         self._last_shown[channel_id or 0] = int(sentence["id"])
         return sentence
@@ -556,7 +575,8 @@ class Sentences(commands.Cog, name=COG_NAME):
     @app_commands.choices(카테고리=[
         app_commands.Choice(name="🎲 전체 (랜덤)", value=CHOICE_ALL),
         app_commands.Choice(name="🧓 한국 속담", value="속담"),
-        app_commands.Choice(name="💡 격언 · 명언", value="명언"),
+        app_commands.Choice(name="📜 격언 · 사자성어", value="격언"),
+        app_commands.Choice(name="💡 명언 · 문학", value="명언"),
         app_commands.Choice(name="☕ 일상 회화", value="일상회화"),
         app_commands.Choice(name="🥽 VRChat 실전 수어", value="VRChat"),
     ])
@@ -574,9 +594,10 @@ class Sentences(commands.Cog, name=COG_NAME):
             return
 
         words = await self.db.get_words_by_ids(related_ids(sentence))
+        terms = self._terms.get(int(sentence["id"]))
         await interaction.followup.send(
-            embed=build_sentence_embed(sentence, words),
-            view=build_card_view(int(sentence["id"]), words),
+            embed=build_sentence_embed(sentence, words, terms),
+            view=build_card_view(int(sentence["id"]), words, terms),
         )
 
     # ── 카드 버튼 · 메뉴 처리 ────────────────────────────────────

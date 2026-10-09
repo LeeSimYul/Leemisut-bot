@@ -1215,6 +1215,37 @@ class Database:
         )
         return int(row["cnt"]) if row else 0
 
+    async def search_words_exact(self, name: str, category: str = "", limit: int = 25) -> list[Row]:
+        """
+        단어명이 정확히 같은 단어. (동음이의어 모두 · 분류 조건은 /수어검색 과 같은 부분 일치)
+        /수어검색 이 '정확히 일치하는 단어'를 먼저 보여 줄 때 씁니다.
+        """
+        name = name.strip()
+        if not name:
+            return []
+        where, params = self._build_filter("", category)
+        return await self.backend.fetch_all(
+            f"SELECT * FROM sign_words WHERE word_name = ?::text AND {where} "
+            "ORDER BY category, word_id LIMIT ?",
+            (name, *params, limit),
+        )
+
+    async def search_words_by_alias(self, name: str, category: str = "", limit: int = 25) -> list[Row]:
+        """
+        표제어에 함께 적힌 다른 이름(aliases)이 정확히 같은 단어. ('감사' → '고맙다,감사' 단어)
+        aliases 는 줄바꿈으로 구분돼 있어, 앞뒤에 줄바꿈을 붙여 한 줄 전체가 같은지 봅니다.
+        """
+        name = name.strip()[:MAX_LIKE_KEYWORD_LENGTH]
+        if not name:
+            return []
+        escaped = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where, params = self._build_filter("", category)
+        return await self.backend.fetch_all(
+            f"SELECT * FROM sign_words WHERE (?::text || aliases || ?::text) LIKE ? ESCAPE '\\' "
+            f"AND {where} ORDER BY word_name, category, word_id LIMIT ?",
+            ("\n", "\n", f"%\n{escaped}\n%", *params, limit),
+        )
+
     async def get_homonym_names(self, names: list[str]) -> set[str]:
         """
         주어진 단어명 중 DB에 2건 이상 있는(동음이의어) 이름만 돌려줍니다.

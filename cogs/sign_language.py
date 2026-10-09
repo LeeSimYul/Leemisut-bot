@@ -32,7 +32,13 @@ cogs/sign_language.py
 ■ 모든 슬래시 명령어는 시작 직후 safe_defer() 로 응답을 미룹니다.
    3초 타임아웃(10062)을 막고, 이미 응답된 상호작용이면 이중 응답 없이 조용히 끝냅니다.
    (같은 토큰으로 여러 PC·프로세스를 켜 두면 하나의 상호작용을 여러 봇이 함께 받습니다)
-■ /수어검색 결과가 여러 개면 5개씩 페이지 버튼(◀ 이전 · 1 / N · ▶ 다음)으로 넘겨 봅니다.
+■ /수어검색 (스마트 검색)
+   - 단어명이 정확히 같은 단어가 1개      → 바로 상세 카드 (검색어가 들어간 다른 단어는 카드 아래 메뉴로)
+   - 같은 이름의 단어(동음이의어)가 여럿  → '찾으시는 의미를 선택해 주세요' + 분야별 선택 메뉴
+   - 정확히 같은 단어가 없으면 다른 이름(동의어 · '감사' → '고맙다,감사')으로 한 번 더 찾습니다.
+   - 검색어가 들어간 단어(부분 일치)       → 선택 메뉴 (25개씩 · 많으면 ◀ ▶ 로 넘김)
+   - 0건                                  → 국립국어원 한국수어사전에서 찾아보는 링크 버튼
+   메뉴에서 고른 단어 카드는 고른 사람에게만 열립니다. 메뉴는 누구나 쓸 수 있고, 페이지는 검색한 사람만 넘깁니다.
    (공용 컴포넌트: utils/paginator.py)
 ■ 오답노트: /수어퀴즈 · /복습퀴즈 에서 틀린 단어(시간 초과 포함)는 user_quiz_notes 에 자동으로
    쌓입니다. /오답노트 로 많이 틀린 순서대로 보고, /복습퀴즈 로 맞히면 해결(마스터)됩니다.
@@ -53,7 +59,9 @@ import logging
 import random
 import re
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from urllib.parse import quote
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as dtime
 
@@ -62,7 +70,9 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from database import QUIZ_TYPE_REVIEW, Database, Row
+from utils.hangul import josa
 from utils.media import (
+    BUTTON_URL_LIMIT,
     PhotoFetcher,
     is_video_url,
     link_buttons,
@@ -90,7 +100,10 @@ KST = timezone(timedelta(hours=9))  # zoneinfo는 Windows에서 tzdata가 필요
 QUIZ_CHOICES = 4
 QUIZ_TIMEOUT = 45  # 초 - /수어퀴즈 · /복습퀴즈 공통 제한 시간
 # 보상 수치(REWARD_* · DAILY_* · REVIEW_REWARD_*)와 하루 상한선은 utils/rewards.py 에 있습니다.
-SEARCH_PAGE_SIZE = 5    # /수어검색 결과 목록 한 페이지에 보여 줄 건수
+SEARCH_PICK_PAGE_SIZE = 25    # /수어검색 고르기 메뉴 한 페이지 (디스코드 선택 메뉴 최대 25개)
+SEARCH_VIEW_TIMEOUT = 300.0   # 초 - /수어검색 메뉴가 잠기기까지 (마지막 조작 기준)
+# 결과가 없을 때 붙이는 국립국어원 한국수어사전 검색 링크 ({keyword} 자리에 검색어가 들어갑니다)
+SLDICT_SEARCH_URL = "https://sldict.korean.go.kr/front/search/searchAllList.do?searchKeyword={keyword}"
 BOOKMARK_PAGE_SIZE = 5  # /수어단어장 한 페이지에 보여 줄 건수
 NOTES_PAGE_SIZE = 5     # /오답노트 한 페이지에 보여 줄 건수
 NOTES_PAGINATOR_TIMEOUT = 180.0  # 초 - /오답노트 페이지 버튼이 잠기기까지 (마지막 조작 기준)
@@ -297,21 +310,24 @@ def build_word_embed(
     return embed, content
 
 
-def build_search_page_embed(
-    words: list[Row], *, conditions: str, total: int, offset: int
-) -> discord.Embed:
-    """/수어검색 결과 목록의 한 페이지. (번호는 전체 결과 기준으로 이어서 매깁니다)"""
-    lines = [
-        f"`{number}.` **{w['word_name']}** [{w['category']}] — {summarize(w['meaning'])}"
-        for number, w in enumerate(words, start=offset + 1)
-    ]
-    body = "\n".join(lines) or "이 페이지의 단어가 방금 삭제되었어요 🥲"
-    embed = discord.Embed(
-        title=f"🔍 수어 검색 결과 (총 {total}개)",
-        description=f"{conditions}\n\n{body}",
-        color=COLOR_SEARCH,
+def search_option(word: Row) -> discord.SelectOption:
+    """검색 결과 고르기 메뉴의 한 줄. ('배 [식생활]' + 수어 설명 앞부분)"""
+    return discord.SelectOption(
+        label=f"{word['word_name']} [{word['category']}]"[:100],
+        value=str(word["word_id"]),
+        description=summarize(word["meaning"], 90)[:100] or None,
     )
-    embed.set_footer(text="자세히 보려면 단어명을 정확히 넣어 다시 검색해 주세요 🤟")
+
+
+def build_search_pick_embed(
+    *, title: str, description: str, words: list[Row], label: str
+) -> discord.Embed:
+    """/수어검색 고르기 화면. 긴 설명 목록 대신 단어 이름만 한 줄로 보여 주고, 고르기는 메뉴로 합니다."""
+    embed = discord.Embed(title=title, description=description, color=COLOR_SEARCH)
+    if words:
+        names = " · ".join(f"`{w['word_name']}`" for w in words)
+        embed.add_field(name=label, value=names[:1024], inline=False)
+    embed.set_footer(text="아래 메뉴에서 고르면 수형 삽화 · 설명 카드가 나에게만 열려요 🤟")
     return embed
 
 
@@ -794,6 +810,131 @@ class NotesPaginatorView(SignPaginatorView):
         )
 
 
+# ── /수어검색 UI ───────────────────────────────────────────────
+class SearchPickSelect(discord.ui.Select):
+    """검색 결과에서 단어를 고르는 메뉴. 고르면 그 단어 카드가 고른 사람에게만 열립니다."""
+
+    def __init__(self, *, placeholder: str, options: list[discord.SelectOption] | None = None,
+                 row: int | None = None) -> None:
+        super().__init__(
+            placeholder=placeholder[:150],
+            options=options or [discord.SelectOption(label="(단어 없음)", value="0")],
+            row=row,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if isinstance(view, (SearchPickView, SearchCardView)) and self.values:
+            await view.pick(interaction, int(self.values[0]))
+
+
+class SearchPickView(SignPaginatorView):
+    """
+    동음이의어 · 부분 일치 결과를 고르는 화면. 메뉴 1개(+ 다른 단어 메뉴 1개)와 페이지 버튼.
+    메뉴는 채널의 누구나 쓸 수 있고(카드는 고른 사람에게만), 페이지 넘기기는 검색한 사람만 합니다.
+    """
+
+    def __init__(
+        self,
+        cog: SignLanguage,
+        owner: discord.abc.User,
+        *,
+        total: int,
+        load_page: Callable[[int], Awaitable[list[Row]]],
+        title: str,
+        description: str,
+        label: str,
+        placeholder: str,
+        extra: list[Row] | None = None,
+        extra_placeholder: str = "",
+    ) -> None:
+        self.cog = cog
+        self.load_page = load_page
+        self.title, self.description, self.label = title, description, label
+        self._words: dict[int, list[Row]] = {}
+        super().__init__(
+            owner, page_count(total, SEARCH_PICK_PAGE_SIZE), self._render, timeout=SEARCH_VIEW_TIMEOUT
+        )
+        self.pick_select = SearchPickSelect(placeholder=placeholder, row=1)
+        self.add_item(self.pick_select)
+        if extra:
+            self.add_item(SearchPickSelect(
+                placeholder=extra_placeholder, options=[search_option(w) for w in extra[:25]], row=2,
+            ))
+
+    async def _render(self, page: int) -> discord.Embed:
+        words = await self.load_page(page)
+        self._words[page] = words
+        title = self.title + (f" ({page + 1}/{self.total_pages})" if self.total_pages > 1 else "")
+        return build_search_pick_embed(
+            title=title, description=self.description, words=words, label=self.label
+        )
+
+    def on_page_change(self) -> None:
+        words = self._words.get(self.page, [])
+        self.pick_select.options = [search_option(w) for w in words] or [
+            discord.SelectOption(label="(단어 없음)", value="0")
+        ]
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        data = interaction.data or {}
+        if data.get("component_type") == discord.ComponentType.select.value:
+            return True  # 메뉴는 누구나 (카드는 고른 사람에게만 열립니다)
+        return await super().interaction_check(interaction)
+
+    async def pick(self, interaction: discord.Interaction, word_id: int) -> None:
+        # 메뉴를 처음 상태로 되돌려 같은 단어를 다시 골라도 열리게 합니다. (/오답노트 와 같은 방식)
+        await interaction.response.defer()
+        async with self._lock:
+            self._last_interaction = interaction
+            await interaction.edit_original_response(view=self)
+        await self.cog.show_search_word(interaction, word_id)
+
+
+class SearchCardView(discord.ui.View):
+    """검색 결과 카드 아래의 영상 · 사전 버튼 + '검색어가 들어간 다른 단어' 메뉴."""
+
+    def __init__(self, cog: SignLanguage, word: Row, others: list[Row], placeholder: str) -> None:
+        super().__init__(timeout=SEARCH_VIEW_TIMEOUT)
+        self.cog = cog
+        self.message: discord.WebhookMessage | None = None
+        self._last_interaction: discord.Interaction | None = None
+        for button in link_buttons(
+            video_url=word["video_url"], detail_url=_row_get(word, "detail_url"), row=0
+        ):
+            self.add_item(button)
+        self.pick_select = SearchPickSelect(
+            placeholder=placeholder, options=[search_option(w) for w in others[:25]], row=1
+        )
+        self.add_item(self.pick_select)
+
+    async def pick(self, interaction: discord.Interaction, word_id: int) -> None:
+        await interaction.response.edit_message(view=self)  # 메뉴 되돌리기 (사진 첨부는 그대로)
+        self._last_interaction = interaction
+        await self.cog.show_search_word(interaction, word_id)
+
+    async def on_timeout(self) -> None:
+        self.pick_select.disabled = True  # 링크 버튼은 그대로 둡니다
+        try:
+            if self._last_interaction is not None:
+                await self._last_interaction.edit_original_response(view=self)
+            elif self.message is not None:
+                await self.message.edit(view=self)
+        except discord.HTTPException:
+            pass
+
+    async def on_error(
+        self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item
+    ) -> None:
+        log.exception("검색 결과 메뉴 처리 중 오류", exc_info=error)
+        with contextlib.suppress(discord.HTTPException):
+            message = "앗, 단어를 여는 중에 문제가 생겼어요 😢 다시 골라 주세요!"
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+
+
 # ── Cog ─────────────────────────────────────────────────────────
 class SignLanguage(commands.Cog, name="수어"):
     def __init__(self, bot: commands.Bot, db: Database) -> None:
@@ -952,49 +1093,150 @@ class SignLanguage(commands.Cog, name="수어"):
             )
             return
 
-        total = await self.db.count_words_by_filter(keyword, category)
-
         conditions = " · ".join(
             part for part in (f"단어명 `{keyword}`" if keyword else "",
                               f"분류 `{category}`" if category else "") if part
         )
 
-        if total == 0:
-            await interaction.followup.send(
-                f"{conditions} 조건에 맞는 수어를 찾지 못했어요 🥲\n"
-                "단어의 일부만 넣어 보시거나, 분류를 비워 두고 다시 찾아 보세요!",
-                ephemeral=True,
+        # 1) 단어명이 정확히 같은 단어 → 없으면 다른 이름(동의어)이 같은 단어
+        exact: list[Row] = []
+        via_alias = False
+        if keyword:
+            exact = await self.db.search_words_exact(keyword, category)
+            if not exact:
+                exact = await self.db.search_words_by_alias(keyword, category)
+                via_alias = bool(exact)
+        total = await self.db.count_words_by_filter(keyword, category)  # 부분 일치 전체
+
+        if not exact and total == 0:
+            await self._send_no_result(interaction, keyword, conditions)
+            return
+
+        # 2) 검색어가 들어간 다른 단어 (정확히 같은 단어는 빼고 메뉴 한 개 분량만)
+        exact_ids = {int(w["word_id"]) for w in exact}
+        partial = await self.db.search_words_by_filter(
+            keyword, category, limit=SEARCH_PICK_PAGE_SIZE + len(exact_ids)
+        )
+        others = [w for w in partial if int(w["word_id"]) not in exact_ids][:SEARCH_PICK_PAGE_SIZE]
+        others_total = total - sum(1 for w in partial if int(w["word_id"]) in exact_ids)
+
+        if len(exact) == 1 or (not exact and total == 1):
+            await self._send_search_card(
+                interaction, exact[0] if exact else others[0], keyword=keyword, conditions=conditions,
+                via_alias=via_alias, others=others if exact else [], others_total=others_total if exact else 0,
             )
             return
 
-        # 결과가 하나면 바로 자세히 보여 줍니다.
-        if total == 1:
-            (word,) = await self.db.search_words_by_filter(keyword, category, limit=1)
-            embed, content = build_word_embed(
-                word,
-                title=f"🔍 수어 검색 : {word['word_name']} [{word['category']}]",
-                color=COLOR_SEARCH,
+        if exact:
+            # 3) 같은 이름의 여러 수어 (동음이의어 · 다의어)
+            subject = f"'{keyword}'{josa(keyword, '을', '를')} 다른 이름으로 가진" if via_alias else "동일한 이름의"
+            description = f"{subject} 여러 수어가 있어요. 찾으시는 의미를 선택해 주세요:"
+            if others:
+                description += (
+                    f"\n🔍 '{keyword}'{josa(keyword, '이', '가')} 들어간 다른 단어 **{others_total}**개는 "
+                    "두 번째 메뉴에서 볼 수 있어요."
+                )
+
+            async def load_exact(page: int) -> list[Row]:
+                start = page * SEARCH_PICK_PAGE_SIZE
+                return exact[start:start + SEARCH_PICK_PAGE_SIZE]
+
+            view = SearchPickView(
+                self, interaction.user, total=len(exact), load_page=load_exact,
+                title=f"🔍 수어 검색 : {keyword}", description=description, label="🗂️ 같은 이름의 수어",
+                placeholder="🔍 찾으시는 의미를 선택해 주세요 (나에게만 보여요)",
+                extra=others, extra_placeholder=f"🔍 '{keyword}'{josa(keyword, '이', '가')} 들어간 다른 단어",
             )
-            embed.description = f"{conditions} 으로 찾은 결과예요."
-            embed.set_footer(text="다른 단어도 찾아볼까요? /수어검색 🤟")
-            photo = await self.photos.attach(embed, word_images(word))
-            await send_with_media_fallback(
-                interaction.followup.send,
-                embed=embed, view=word_link_view(word), photo=photo, content=content,
-            )
+            await view.start(interaction)
             return
 
-        # 여러 개면 SEARCH_PAGE_SIZE 개씩 나눠 버튼(◀ 이전 · 1 / N · ▶ 다음)으로 넘겨 봅니다.
-        async def render_page(page: int) -> discord.Embed:
-            """버튼을 누를 때마다 그 페이지의 단어만 DB에서 가져옵니다."""
-            offset = page * SEARCH_PAGE_SIZE
-            words = await self.db.search_words_by_filter(
-                keyword, category, limit=SEARCH_PAGE_SIZE, offset=offset
+        # 4) 검색어가 들어간 단어 여러 개 (또는 분야 전체)
+        async def load_partial(page: int) -> list[Row]:
+            return await self.db.search_words_by_filter(
+                keyword, category, limit=SEARCH_PICK_PAGE_SIZE, offset=page * SEARCH_PICK_PAGE_SIZE
             )
-            return build_search_page_embed(words, conditions=conditions, total=total, offset=offset)
 
-        view = SignPaginatorView(interaction.user, page_count(total, SEARCH_PAGE_SIZE), render_page)
+        view = SearchPickView(
+            self, interaction.user, total=total, load_page=load_partial,
+            title="🔍 수어 검색 결과",
+            description=f"{conditions} · 총 **{total}**개\n원하는 단어를 아래 메뉴에서 골라 주세요.",
+            label="📋 이 메뉴의 단어",
+            placeholder="🔍 단어를 골라 상세 카드 보기 (나에게만 보여요)",
+        )
         await view.start(interaction)
+
+    async def _send_search_card(
+        self,
+        interaction: discord.Interaction,
+        word: Row,
+        *,
+        keyword: str,
+        conditions: str,
+        via_alias: bool,
+        others: list[Row],
+        others_total: int,
+    ) -> None:
+        """검색 결과 1건을 바로 상세 카드로. (다른 단어가 있으면 카드 아래 메뉴로)"""
+        embed, content = build_word_embed(
+            word, title=f"🔍 수어 검색 : {word['word_name']} [{word['category']}]", color=COLOR_SEARCH,
+        )
+        if via_alias:
+            embed.description = (
+                f"'{keyword}'{josa(keyword, '은', '는')} **{word['word_name']}** 수어와 같은 표제어에 "
+                "함께 실린 말이에요."
+            )
+        else:
+            embed.description = f"{conditions} 으로 찾은 결과예요."
+        view: discord.ui.View | None
+        if others:
+            embed.description += (
+                f"\n🔍 '{keyword}'{josa(keyword, '이', '가')} 들어간 다른 단어도 **{others_total}**개 있어요. "
+                "아래 메뉴에서 골라 보세요!"
+            )
+            view = SearchCardView(
+                self, word, others,
+                placeholder=f"🔍 '{keyword}'{josa(keyword, '이', '가')} 들어간 다른 단어 (나에게만 보여요)",
+            )
+        else:
+            view = word_link_view(word)
+        embed.set_footer(text="다른 단어도 찾아볼까요? /수어검색 🤟")
+        photo = await self.photos.attach(embed, word_images(word))
+        message = await send_with_media_fallback(
+            interaction.followup.send,
+            embed=embed, view=view, photo=photo, content=content, wait=True,
+        )
+        if isinstance(view, SearchCardView):
+            view.message = message
+
+    async def _send_no_result(
+        self, interaction: discord.Interaction, keyword: str, conditions: str
+    ) -> None:
+        """결과 0건: 안내 + 국립국어원 한국수어사전 검색 링크 버튼."""
+        message = (
+            f"{conditions} 조건에 맞는 수어를 찾지 못했어요 🥲\n"
+            "단어의 일부만 넣어 보시거나, 분류를 비워 두고 다시 찾아 보세요!"
+        )
+        view = discord.utils.MISSING
+        url = secure_url(SLDICT_SEARCH_URL.format(keyword=quote(keyword)), limit=BUTTON_URL_LIMIT) if keyword else ""
+        if url:
+            message += "\n이미숫 사전에 아직 없는 단어일 수 있어요. 국립국어원 한국수어사전에서 직접 찾아볼 수도 있어요 👇"
+            view = discord.ui.View(timeout=None)
+            view.add_item(discord.ui.Button(label="국립국어원 한국수어사전에서 찾기", emoji="🔎", url=url))
+        await interaction.followup.send(message, view=view, ephemeral=True)
+
+    async def show_search_word(self, interaction: discord.Interaction, word_id: int) -> None:
+        """검색 결과 메뉴에서 고른 단어 카드를 고른 사람에게만 보냅니다. (응답을 미룬 뒤에 부름)"""
+        word = await self.db.get_word_by_id(word_id)
+        if word is None:
+            await interaction.followup.send(
+                "이 단어는 사전에서 찾을 수 없어요 🥲 (사전이 새로 동기화됐을 수 있어요)", ephemeral=True
+            )
+            return
+        await self.send_word_card(
+            interaction, word,
+            title=f"🔍 수어 검색 : {word['word_name']} [{word['category']}]",
+            footer="검색 결과에서 고른 단어예요 · 다른 단어도 찾아볼까요? /수어검색 🤟",
+        )
 
     @search_sign.autocomplete("분류")
     async def category_autocomplete(
