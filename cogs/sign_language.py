@@ -325,7 +325,11 @@ def build_search_pick_embed(
     """/수어검색 고르기 화면. 긴 설명 목록 대신 단어 이름만 한 줄로 보여 주고, 고르기는 메뉴로 합니다."""
     embed = discord.Embed(title=title, description=description, color=COLOR_SEARCH)
     if words:
-        names = " · ".join(f"`{w['word_name']}`" for w in words)
+        # 같은 이름이 겹치면(동음이의어) 분야를 붙여 구분합니다. ('배 · 배 · 배' → '배 [개념] · 배 [식생활]')
+        repeated = len({w["word_name"] for w in words}) < len(words)
+        names = " · ".join(
+            f"`{w['word_name']} [{w['category']}]`" if repeated else f"`{w['word_name']}`" for w in words
+        )
         embed.add_field(name=label, value=names[:1024], inline=False)
     embed.set_footer(text="아래 메뉴에서 고르면 수형 삽화 · 설명 카드가 나에게만 열려요 🤟")
     return embed
